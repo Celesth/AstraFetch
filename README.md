@@ -53,9 +53,9 @@ Install a userscript manager:
 ### Script Installation
 
 Create a new userscript and paste the AstraFetch script, or install directly from GitHub:
-
-https://raw.githubusercontent.com/Celesth/AstraFetch/main/astrafetch.user.js
-
+```yaml
+https://raw.githubusercontent.com/Celesth/AstraFetch/refs/heads/main/AstraFetch.user.js
+```
 
 ---
 
