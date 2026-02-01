@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         AstraFetch (Universal)
 // @namespace    https://github.com/Celesth/AstraFetch
+// @icon         https://cdn.discordapp.com/attachments/1399627953977167902/1465377210037698827/Screenshot_2026-01-26-21-26-16-532_com.miui.mediaviewer.png
 // @version      0.3.0
 // @description  Universal video stream detector with yt-dlp & aria2 command generator
 // @match        *://*/*
