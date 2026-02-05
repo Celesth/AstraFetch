@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         AstraFetch (Stream Analyzer)
+// @name         hyprNET (Stream Analyzer)
 // @namespace    https://github.com/Celesth/AstraFetch
-// @icon         https://cdn.discordapp.com/attachments/1399627953977167902/1465377210037698827/Screenshot_2026-01-26-21-26-16-532_com.miui.mediaviewer.png
-// @version      0.5.0
-// @description  Hyprland-style stream analyzer with command helpers
+// @icon         https://files.catbox.moe/cd88m5.png
+// @version      0.6.0
+// @description  Hyprland-style network + media intelligence HUD (analysis-safe)
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
@@ -12,7 +12,9 @@
 (() => {
   "use strict";
 
-  /* ---------------- Config ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                Configuration                               */
+  /* -------------------------------------------------------------------------- */
 
   const CONFIG = {
     triggerKey: "/",
@@ -20,14 +22,19 @@
     guiPosition: "bottom-right", // top-left | top-right | bottom-left | bottom-right
     width: 520,
     height: 320,
-    maxEntries: 200,
-    maxSamples: 6,
+    maxEntries: 250,
+    maxSamples: 8,
     slowThreshold: 800,
     pingInterval: 1500,
-    toastDuration: 2200
+    overlayOutlineColor: "rgba(56, 189, 248, 0.6)",
+    toastDuration: 2200,
+    discordWebhook: "", // optional webhook URL
+    discordRateLimitMs: 15_000
   };
 
-  /* ---------------- State ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                   State                                    */
+  /* -------------------------------------------------------------------------- */
 
   const STATE = {
     title: null,
@@ -35,14 +42,34 @@
     entries: new Map(),
     needsRender: false,
     groupState: new Map(),
-    encryptedDetected: false
+    encryptedDetected: false,
+    cache: {
+      seenUrls: new Map(),
+      streamFingerprints: new Map(),
+      commandCache: new Map()
+    },
+    console: {
+      open: false,
+      logs: []
+    },
+    media: {
+      elements: new Set(),
+      overlay: null,
+      activeElement: null
+    },
+    lastHlsUrl: null,
+    discordLastSent: 0
   };
 
   let hud;
+  let consolePanel;
   let pingTimer;
   let mutationObserver;
+  let mediaObserver;
 
-  /* ---------------- Styles ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                    Styles                                  */
+  /* -------------------------------------------------------------------------- */
 
   GM_addStyle(`
     #af-hud {
@@ -53,9 +80,9 @@
       color: #e5e7eb;
     }
 
-    #af-hud .panel {
+    #af-hud .panel,
+    #af-console {
       width: ${CONFIG.width}px;
-      height: ${CONFIG.height}px;
       background: rgba(12, 12, 14, 0.92);
       border: 1px solid #1e1e22;
       border-radius: 12px;
@@ -65,6 +92,10 @@
       gap: 10px;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
       backdrop-filter: blur(8px);
+    }
+
+    #af-hud .panel {
+      height: ${CONFIG.height}px;
     }
 
     #af-hud .topbar {
@@ -98,7 +129,8 @@
       margin-top: 2px;
     }
 
-    #af-hud .divider {
+    #af-hud .divider,
+    #af-console .divider {
       height: 1px;
       background: #1e1e22;
     }
@@ -120,7 +152,7 @@
       display: flex;
       flex-direction: column;
       gap: 6px;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
     }
 
     #af-hud .row.success { border-color: rgba(34, 197, 94, 0.5); }
@@ -129,6 +161,7 @@
     #af-hud .row.blocked { border-color: rgba(148, 163, 184, 0.6); }
     #af-hud .row.streaming { border-color: rgba(56, 189, 248, 0.6); }
     #af-hud .row.encrypted { border-color: rgba(248, 113, 113, 0.8); box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35); }
+    #af-hud .row.pending { border-color: rgba(100, 116, 139, 0.5); }
 
     #af-hud .row-head {
       display: grid;
@@ -197,7 +230,7 @@
     }
 
     #af-hud .samples.open {
-      max-height: 200px;
+      max-height: 220px;
     }
 
     #af-hud .group {
@@ -227,7 +260,23 @@
       transform: rotate(90deg);
     }
 
-    #af-hud button {
+    #af-hud .chart {
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 24px;
+      margin-top: 4px;
+    }
+
+    #af-hud .chart span {
+      flex: 1;
+      background: rgba(59, 130, 246, 0.5);
+      border-radius: 3px;
+      transition: height 0.2s ease;
+    }
+
+    #af-hud button,
+    #af-console button {
       border: 1px solid #1e1e22;
       background: #141414;
       color: #e5e7eb;
@@ -237,8 +286,47 @@
       cursor: pointer;
     }
 
-    #af-hud button:hover {
+    #af-hud button:hover,
+    #af-console button:hover {
       background: #1f1f1f;
+    }
+
+    #af-console {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      z-index: 2147483647;
+      width: 420px;
+      max-height: 380px;
+      display: none;
+    }
+
+    #af-console .log-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 0.68rem;
+    }
+
+    #af-console .log-entry.warn { color: #fbbf24; }
+    #af-console .log-entry.error { color: #f87171; }
+
+    #af-console .input-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px;
+    }
+
+    #af-console input {
+      width: 100%;
+      background: #0f0f0f;
+      border: 1px solid #1e1e22;
+      color: #e5e7eb;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 0.68rem;
     }
 
     #af-toast {
@@ -258,6 +346,38 @@
     }
 
     #af-toast.show { opacity: 1; transform: translateY(0); }
+
+    #af-media-overlay {
+      position: fixed;
+      z-index: 2147483646;
+      background: rgba(12, 12, 14, 0.88);
+      border: 1px solid #1e1e22;
+      border-radius: 12px;
+      padding: 10px 12px;
+      color: #e5e7eb;
+      font-size: 0.7rem;
+      display: none;
+      pointer-events: auto;
+      backdrop-filter: blur(8px);
+      min-width: 220px;
+    }
+
+    #af-media-overlay .overlay-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    #af-media-overlay .overlay-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+
+    #af-media-overlay .overlay-actions button {
+      font-size: 0.62rem;
+    }
   `);
 
   function positionStyle() {
@@ -268,7 +388,31 @@
     `;
   }
 
-  /* ---------------- Utils ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                   Logging                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function log(level, message, data = null) {
+    const entry = {
+      level,
+      message,
+      data,
+      time: new Date().toLocaleTimeString()
+    };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || \"\");
+    return stack.includes(\"hyprNET\") || stack.includes(\"AstraFetch.user.js\");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
 
   function toast(text, duration = CONFIG.toastDuration) {
     let el = document.getElementById("af-toast");
@@ -320,19 +464,30 @@
     });
   }
 
+  function safeClipboard(text) {
+    GM_setClipboard(text);
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                              Entry Management                              */
+  /* -------------------------------------------------------------------------- */
+
+  // Store request metadata without reading response bodies (CORS-safe).
   function addEntry(url, source = "network", method = "GET", initiator = "") {
     const clean = normalizeUrl(url);
     if (!clean) return null;
     const tag = classify(clean, initiator || source);
+
     if (!STATE.entries.has(clean)) {
       const created = {
         url: clean,
         tag,
         source,
         method,
-        status: "idle",
+        status: "pending",
         addedAt: Date.now(),
         count: 0,
+        failures: 0,
         totalDuration: 0,
         lastDuration: 0,
         totalTransfer: 0,
@@ -340,20 +495,39 @@
         samples: [],
         open: false,
         warned: false,
-        encrypted: false
+        encrypted: false,
+        hls: {
+          analyzed: false,
+          variants: [],
+          segments: [],
+          error: null,
+          audioOnly: false
+        },
+        probes: []
       };
       STATE.entries.set(clean, created);
       if (STATE.entries.size > CONFIG.maxEntries) {
         const oldest = STATE.entries.keys().next().value;
         STATE.entries.delete(oldest);
       }
-      toast(`Detected ${tag.toUpperCase()}`);
-      if (tag === "hls" && !created.warned) {
-        created.warned = true;
-        toast("M3U8 detected. Encrypted streams require external tools.");
+
+      if (!STATE.cache.seenUrls.has(clean)) {
+        STATE.cache.seenUrls.set(clean, Date.now());
+        toast(`Detected ${tag.toUpperCase()}`);
       }
+
+      if (tag === "hls") {
+        STATE.lastHlsUrl = clean;
+        if (!created.warned) {
+          created.warned = true;
+          toast("M3U8 detected. Encrypted streams require external tools.");
+        }
+      }
+
+      maybeSendWebhook(created);
       scheduleRender();
     }
+
     return STATE.entries.get(clean);
   }
 
@@ -364,7 +538,31 @@
     scheduleRender();
   }
 
-  /* ---------------- Network Hook ---------------- */
+  function updateSample(entry, duration, transfer, status) {
+    if (!entry) return;
+    entry.count += 1;
+    entry.totalDuration += duration;
+    entry.totalTransfer += transfer;
+    entry.lastDuration = duration;
+    entry.status = status || entry.status;
+    if (String(status).startsWith("4") || String(status).startsWith("5") || status === "ERR") {
+      entry.failures += 1;
+    }
+    if (transfer && duration) {
+      entry.bitrate = ((transfer * 8) / (duration / 1000)) / 1e6;
+    }
+    entry.samples.unshift({
+      duration,
+      transfer,
+      status
+    });
+    if (entry.samples.length > CONFIG.maxSamples) entry.samples.pop();
+    scheduleRender();
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                              Network Observation                            */
+  /* -------------------------------------------------------------------------- */
 
   function hookNetwork() {
     const _fetch = window.fetch;
@@ -383,6 +581,7 @@
         const duration = performance.now() - start;
         updateStatus(url, "ERR");
         updateSample(entry, duration, 0, "ERR");
+        log("error", "fetch error", error?.message || error);
         throw error;
       }
     };
@@ -416,8 +615,6 @@
     };
   }
 
-  /* ---------------- Resource Timing ---------------- */
-
   function setupPerformanceObserver() {
     if (!("PerformanceObserver" in window)) return;
     const observer = new PerformanceObserver(list => {
@@ -449,29 +646,344 @@
     if (flagged && !STATE.encryptedDetected) {
       STATE.encryptedDetected = true;
       toast("Encrypted HLS detected. Switching to analysis-only mode.");
+      log("warn", "Encrypted HLS detected", origin);
     }
   }
 
-  function updateSample(entry, duration, transfer, status) {
-    if (!entry) return;
-    entry.count += 1;
-    entry.totalDuration += duration;
-    entry.totalTransfer += transfer;
-    entry.lastDuration = duration;
-    entry.status = status || entry.status;
-    if (transfer && duration) {
-      entry.bitrate = ((transfer * 8) / (duration / 1000)) / 1e6;
+  /* -------------------------------------------------------------------------- */
+  /*                             HLS Intelligence                               */
+  /* -------------------------------------------------------------------------- */
+
+  // Attempt to inspect playlists only when CORS allows; never decrypt or bypass DRM.
+  async function analyzeHls(entry) {
+    if (!entry || entry.hls.analyzed || entry.encrypted) return;
+    entry.hls.analyzed = true;
+    entry.hls.error = null;
+    updateStatus(entry.url, "analyzing");
+    try {
+      const res = await fetch(entry.url, { credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const parsed = parsePlaylist(text, entry.url);
+      entry.hls.variants = parsed.variants;
+      entry.hls.segments = parsed.segments;
+      entry.hls.audioOnly = parsed.audioOnly;
+      if (parsed.encrypted) {
+        entry.encrypted = true;
+        entry.status = "encrypted";
+        toast("Encrypted HLS detected via EXT-X-KEY.");
+      } else {
+        entry.status = "ok";
+      }
+      updateStatus(entry.url, entry.status);
+      scheduleRender();
+    } catch (error) {
+      entry.hls.error = "CORS blocked or unavailable";
+      updateStatus(entry.url, "blocked");
+      toast("HLS inspection blocked by CORS.");
+      log("warn", "HLS inspection blocked", error?.message || error);
     }
-    entry.samples.unshift({
-      duration,
-      transfer,
-      status
-    });
-    if (entry.samples.length > CONFIG.maxSamples) entry.samples.pop();
+  }
+
+  function parsePlaylist(text, baseUrl) {
+    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const variants = [];
+    const segments = [];
+    let encrypted = false;
+    let audioOnly = false;
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (line.startsWith("#EXT-X-KEY")) encrypted = true;
+      if (line.startsWith("#EXT-X-STREAM-INF")) {
+        const bandwidth = Number(line.match(/BANDWIDTH=(\d+)/i)?.[1] || 0);
+        const resolution = line.match(/RESOLUTION=(\d+x\d+)/i)?.[1] || "";
+        const uri = lines[i + 1] && !lines[i + 1].startsWith("#") ? lines[i + 1] : null;
+        if (uri) {
+          variants.push({
+            bandwidth,
+            resolution,
+            url: new URL(uri, baseUrl).href
+          });
+        }
+      }
+      if (!line.startsWith("#")) {
+        segments.push(new URL(line, baseUrl).href);
+      }
+      if (line.includes("TYPE=AUDIO")) audioOnly = true;
+    }
+
+    return {
+      variants: variants.sort((a, b) => b.bandwidth - a.bandwidth),
+      segments,
+      encrypted,
+      audioOnly
+    };
+  }
+
+  async function probeVariants(entry) {
+    if (!entry) return;
+    const candidates = entry.hls.variants.length
+      ? entry.hls.variants.slice(0, 5).map(variant => ({
+        url: variant.url,
+        resolution: variant.resolution,
+        status: "pending"
+      }))
+      : generateQualityProbes(entry.url);
+    if (!candidates.length) return;
+    const probes = candidates.map(candidate => ({ ...candidate }));
+    entry.probes = probes;
+    scheduleRender();
+
+    await Promise.all(
+      probes.map(async probe => {
+        try {
+          const res = await fetch(probe.url, { method: "HEAD" });
+          probe.status = res.ok ? "ok" : `HTTP ${res.status}`;
+        } catch {
+          probe.status = "blocked";
+        }
+      })
+    );
     scheduleRender();
   }
 
-  /* ---------------- UI ---------------- */
+  function generateQualityProbes(url) {
+    const resolutions = ["2160", "1440", "1080", "720", "480", "360"];
+    const probes = [];
+    const pattern = url.match(/(\\d{3,4})p/i);
+    if (pattern) {
+      resolutions.forEach(res => {
+        probes.push({
+          url: url.replace(/\\d{3,4}p/i, `${res}p`),
+          resolution: `${res}p`,
+          status: "pending"
+        });
+      });
+      return probes;
+    }
+    const sizePattern = url.match(/(\\d{3,4}x\\d{3,4})/i);
+    if (sizePattern) {
+      const sizes = ["3840x2160", "2560x1440", "1920x1080", "1280x720", "854x480", "640x360"];
+      sizes.forEach(size => {
+        probes.push({
+          url: url.replace(/\\d{3,4}x\\d{3,4}/i, size),
+          resolution: size,
+          status: "pending"
+        });
+      });
+      return probes;
+    }
+    return probes;
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                              Media Overlay                                 */
+  /* -------------------------------------------------------------------------- */
+
+  function setupMediaObserver() {
+    if (mediaObserver) return;
+    mediaObserver = new MutationObserver(scanMediaElements);
+    mediaObserver.observe(document.documentElement, { childList: true, subtree: true });
+    scanMediaElements();
+  }
+
+  function scanMediaElements() {
+    const elements = document.querySelectorAll("video, audio");
+    elements.forEach(element => {
+      if (STATE.media.elements.has(element)) return;
+      STATE.media.elements.add(element);
+      element.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
+      element.addEventListener("mouseenter", () => showMediaOverlay(element));
+      element.addEventListener("mouseleave", hideMediaOverlay);
+    });
+  }
+
+  function showMediaOverlay(element) {
+    const overlay = getMediaOverlay();
+    const rect = element.getBoundingClientRect();
+    const info = getMediaInfo(element);
+    overlay.innerHTML = `
+      <div class="overlay-title">Media Inspector</div>
+      <div>${info.type}</div>
+      <div>${info.url}</div>
+      <div>${info.stats}</div>
+      <div class="overlay-actions">
+        <button data-action="yt-dlp">yt-dlp</button>
+        <button data-action="ffmpeg">ffmpeg</button>
+        <button data-action="aria2">aria2c</button>
+      </div>
+    `;
+    overlay.onclick = () => {
+      const defaultAction = info.tag === "hls"
+        ? "yt-dlp"
+        : isDirectFile(info.url)
+          ? "aria2"
+          : "yt-dlp";
+      handleOverlayAction(defaultAction, info);
+    };
+    overlay.style.top = `${rect.top + rect.height / 2 - 60}px`;
+    overlay.style.left = `${rect.left + rect.width / 2 - 140}px`;
+    overlay.style.display = "block";
+    STATE.media.activeElement = element;
+
+    overlay.querySelectorAll("button").forEach(button => {
+      button.addEventListener("click", event => {
+        event.stopPropagation();
+        handleOverlayAction(button.dataset.action, info);
+      });
+    });
+  }
+
+  function hideMediaOverlay() {
+    const overlay = STATE.media.overlay;
+    if (overlay) overlay.style.display = "none";
+  }
+
+  function getMediaOverlay() {
+    if (STATE.media.overlay) return STATE.media.overlay;
+    const overlay = document.createElement("div");
+    overlay.id = "af-media-overlay";
+    document.body.appendChild(overlay);
+    STATE.media.overlay = overlay;
+    return overlay;
+  }
+
+  function getMediaInfo(element) {
+    const src = element.currentSrc || element.src ||
+      element.querySelector("source")?.src || "unknown";
+    const url = src.startsWith("blob:") && STATE.lastHlsUrl ? STATE.lastHlsUrl : src;
+    const tag = url.includes(".m3u8") ? "hls" : "media";
+    const duration = element.duration && Number.isFinite(element.duration)
+      ? element.duration
+      : 0;
+    const bitrate = estimateBitrate(url);
+    const size = bitrate && duration ? (bitrate * 125000 * duration) : 0;
+    return {
+      url,
+      type: tag === "hls" ? "HLS" : element.tagName.toLowerCase(),
+      stats: `~${formatBitrate(bitrate)} · ${formatBytes(size)} · ${duration ? duration.toFixed(1) + "s" : "dur n/a"}`,
+      tag
+    };
+  }
+
+  function estimateBitrate(url) {
+    const entry = STATE.entries.get(normalizeUrl(url));
+    return entry?.bitrate || null;
+  }
+
+  function handleOverlayAction(action, info) {
+    if (!info.url || info.url === "unknown") {
+      toast("No media URL detected");
+      return;
+    }
+    if (action === "yt-dlp") {
+      safeClipboard(buildYtDlpCommand(info.url, info.tag === "hls"));
+      toast("yt-dlp command copied");
+      return;
+    }
+    if (action === "ffmpeg") {
+      safeClipboard(buildFfmpegCommand(info.url));
+      toast("ffmpeg command copied");
+      return;
+    }
+    if (action === "aria2") {
+      safeClipboard(buildAriaCommand(info.url));
+      toast("aria2c command copied");
+    }
+  }
+
+  function isDirectFile(url) {
+    return /\\.(mp4|webm|mkv|mp3|ogg|wav)(\\?|$)/i.test(url || \"\");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                Command Builders                             */
+  /* -------------------------------------------------------------------------- */
+
+  function headerFlags() {
+    const ua = navigator.userAgent.replace(/"/g, "\\\"");
+    const cookie = document.cookie ? `--add-header "Cookie:${document.cookie}"` : "--cookies \"cookies.txt\"";
+    return [
+      `--add-header "User-Agent:${ua}"`,
+      `--add-header "Referer:${location.href}"`,
+      `--add-header "Origin:${location.origin}"`,
+      cookie
+    ].join(" ");
+  }
+
+  function buildYtDlpCommand(url, isHls = false) {
+    const key = `yt:${url}:${isHls}`;
+    if (STATE.cache.commandCache.has(key)) return STATE.cache.commandCache.get(key);
+    const cmd = [
+      "yt-dlp",
+      headerFlags(),
+      isHls ? "--downloader ffmpeg" : "",
+      "-f \"bestvideo+bestaudio/best\"",
+      "--merge-output-format mp4",
+      `-o \"${safeFilename()}_%(epoch)s.%(ext)s\"`,
+      `\"${url}\"`
+    ].filter(Boolean).join(" ");
+    STATE.cache.commandCache.set(key, cmd);
+    return cmd;
+  }
+
+  function buildAriaCommand(url) {
+    const key = `ar:${url}`;
+    if (STATE.cache.commandCache.has(key)) return STATE.cache.commandCache.get(key);
+    const cmd = [
+      "aria2c -x16 -s16 -k1M",
+      `--header=\"User-Agent:${navigator.userAgent}\"`,
+      `--header=\"Referer:${location.href}\"`,
+      `--header=\"Origin:${location.origin}\"`,
+      document.cookie ? `--header=\"Cookie:${document.cookie}\"` : "--load-cookies=cookies.txt",
+      `\"${url}\"`
+    ].join(" ");
+    STATE.cache.commandCache.set(key, cmd);
+    return cmd;
+  }
+
+  function buildHlsCommand(url) {
+    const key = `hls:${url}`;
+    if (STATE.cache.commandCache.has(key)) return STATE.cache.commandCache.get(key);
+    const cmd = [
+      "yt-dlp",
+      headerFlags(),
+      "--downloader ffmpeg",
+      "--downloader-args \"ffmpeg_i:-headers 'User-Agent: " + navigator.userAgent + "\\r\\nReferer: " + location.href + "\\r\\nOrigin: " + location.origin + "'\"",
+      "-f \"bv*+ba/b\"",
+      "--merge-output-format mp4",
+      `-o \"${safeFilename()}_%(epoch)s.%(ext)s\"`,
+      `\"${url}\"`
+    ].join(" ");
+    STATE.cache.commandCache.set(key, cmd);
+    return cmd;
+  }
+
+  function buildFfmpegCommand(url) {
+    const key = `ff:${url}`;
+    if (STATE.cache.commandCache.has(key)) return STATE.cache.commandCache.get(key);
+    const cmd = [
+      "ffmpeg",
+      `-headers \"User-Agent: ${navigator.userAgent}\\r\\nReferer: ${location.href}\\r\\nOrigin: ${location.origin}\"`,
+      document.cookie ? `-headers \"Cookie: ${document.cookie}\"` : "",
+      `-i \"${url}\"`,
+      "-c copy",
+      `\"${safeFilename()}_%(epoch)s.mp4\"`
+    ].filter(Boolean).join(" ");
+    STATE.cache.commandCache.set(key, cmd);
+    return cmd;
+  }
+
+  function safeFilename() {
+    return (STATE.title || location.hostname || "download")
+      .replace(/[\\/:*?"<>|]/g, "")
+      .slice(0, 60);
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                  UI & HUD                                 */
+  /* -------------------------------------------------------------------------- */
 
   function createHUD() {
     hud = document.createElement("div");
@@ -481,18 +993,25 @@
         <div>
           <div class="topbar">
             <div class="top-left">
-              <span>AstraFetch</span>
+              <span>hyprNET</span>
               <span class="ping" id="af-ping">ping --</span>
             </div>
-            <span>${CONFIG.triggerKey} to toggle</span>
+            <div>
+              <button id="af-console-toggle">Console</button>
+            </div>
           </div>
-          <div class="subtitle">Hyprland-style stream analyzer (analysis-safe)</div>
+          <div class="subtitle">Analysis-safe network & media HUD</div>
         </div>
         <div class="divider"></div>
         <div class="rows" id="af-rows"></div>
       </div>
     `;
     document.body.appendChild(hud);
+
+    hud.querySelector("#af-console-toggle")?.addEventListener("click", () => {
+      STATE.console.open = !STATE.console.open;
+      renderConsole();
+    });
   }
 
   function renderRows() {
@@ -550,7 +1069,11 @@
               <div>${formatDuration(entry.lastDuration)} last</div>
               <div>${entry.count} hits · ${formatDuration(entry.totalDuration / (entry.count || 1))} avg</div>
               <div>${formatBitrate(entry.bitrate)}</div>
+          <div>${entry.encrypted ? "encrypted" : entry.hls.audioOnly ? "audio-only" : ""}</div>
+          <div>${entry.failures} fails</div>
+          <div>${entry.hls.segments.length ? `${entry.hls.segments.length} segments` : ""}</div>
             </div>
+            <div class="chart"></div>
             <div class="actions"></div>
             <div class="samples ${entry.open ? "open" : ""}"></div>
           `;
@@ -560,65 +1083,132 @@
             renderRows();
           });
 
-          const actions = row.querySelector(".actions");
-          if (actions) {
-            actions.appendChild(
-              makeButton("Copy URL", () => {
-                GM_setClipboard(entry.url);
-                toast("URL copied");
-              })
-            );
-
-            if (entry.tag === "media") {
-              actions.appendChild(
-                makeButton("Copy yt-dlp", () => {
-                  GM_setClipboard(buildYtDlpCommand(entry.url));
-                  toast("yt-dlp command copied");
-                })
-              );
-              actions.appendChild(
-                makeButton("Copy aria2", () => {
-                  GM_setClipboard(buildAriaCommand(entry.url));
-                  toast("aria2c command copied");
-                })
-              );
-            }
-
-            if (entry.tag === "hls") {
-              const label = entry.encrypted ? "HLS (encrypted)" : "Copy HLS cmd";
-              actions.appendChild(
-                makeButton(label, () => {
-                  if (entry.encrypted) {
-                    toast("Encrypted HLS detected. Use external tools with keys.");
-                    return;
-                  }
-                  GM_setClipboard(buildHlsCommand(entry.url));
-                  toast("HLS command copied");
-                })
-              );
-            }
-          }
-
-          const samples = row.querySelector(".samples");
-          if (samples && entry.open) {
-            entry.samples.forEach(sample => {
-              const line = document.createElement("div");
-              line.textContent = `${formatDuration(sample.duration)} · ${formatBytes(sample.transfer)} · ${sample.status}`;
-              if (sample.duration > CONFIG.slowThreshold) {
-                line.style.color = "#fbbf24";
-              }
-              if (String(sample.status).startsWith("4") || String(sample.status).startsWith("5") || sample.status === "ERR") {
-                line.style.color = "#f87171";
-              }
-              samples.appendChild(line);
-            });
-          }
+          renderChart(row.querySelector(".chart"), entry.samples);
+          renderActions(row.querySelector(".actions"), entry);
+          renderSamples(row.querySelector(".samples"), entry);
 
           wrapper.appendChild(row);
         });
       }
 
       container.appendChild(wrapper);
+    });
+  }
+
+  function renderActions(container, entry) {
+    if (!container) return;
+    container.innerHTML = "";
+
+    container.appendChild(
+      makeButton("Copy URL", () => {
+        safeClipboard(entry.url);
+        toast("URL copied");
+      })
+    );
+
+    if (entry.tag === "media") {
+      container.appendChild(
+        makeButton("Copy yt-dlp", () => {
+          safeClipboard(buildYtDlpCommand(entry.url));
+          toast("yt-dlp command copied");
+        })
+      );
+      container.appendChild(
+        makeButton("Copy aria2", () => {
+          safeClipboard(buildAriaCommand(entry.url));
+          toast("aria2c command copied");
+        })
+      );
+    }
+
+    if (entry.tag === "hls") {
+      container.appendChild(
+        makeButton(entry.encrypted ? "HLS (encrypted)" : "Copy HLS cmd", () => {
+          if (entry.encrypted) {
+            toast("Encrypted HLS detected. Use external tools with keys.");
+            return;
+          }
+          safeClipboard(buildHlsCommand(entry.url));
+          toast("HLS command copied");
+        })
+      );
+      container.appendChild(
+        makeButton("Analyze HLS", () => analyzeHls(entry))
+      );
+      if (entry.hls.variants.length) {
+        container.appendChild(
+          makeButton("Probe Qualities", () => probeVariants(entry))
+        );
+      }
+    }
+
+    container.appendChild(
+      makeButton(entry.open ? "Hide Samples" : "Show Samples", () => {
+        entry.open = !entry.open;
+        renderRows();
+      })
+    );
+  }
+
+  function renderSamples(container, entry) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!entry.open) return;
+
+    entry.samples.forEach(sample => {
+      const line = document.createElement("div");
+      line.textContent = `${formatDuration(sample.duration)} · ${formatBytes(sample.transfer)} · ${sample.status}`;
+      if (sample.duration > CONFIG.slowThreshold) {
+        line.style.color = "#fbbf24";
+      }
+      if (String(sample.status).startsWith("4") || String(sample.status).startsWith("5") || sample.status === "ERR") {
+        line.style.color = "#f87171";
+      }
+      container.appendChild(line);
+    });
+
+    if (entry.hls.variants.length) {
+      const variantHeader = document.createElement("div");
+      variantHeader.textContent = "Variants:";
+      container.appendChild(variantHeader);
+      entry.hls.variants.slice(0, 4).forEach(variant => {
+        const line = document.createElement("div");
+        line.textContent = `${variant.resolution || "auto"} · ${Math.round(variant.bandwidth / 1000)} kbps`;
+        container.appendChild(line);
+      });
+    }
+
+    if (entry.probes.length) {
+      const probeHeader = document.createElement("div");
+      probeHeader.textContent = "Probe results:";
+      container.appendChild(probeHeader);
+      entry.probes.forEach(probe => {
+        const line = document.createElement("div");
+        line.textContent = `${probe.resolution || "auto"} · ${probe.status}`;
+        container.appendChild(line);
+      });
+    }
+
+    if (entry.hls.error) {
+      const errorLine = document.createElement("div");
+      errorLine.style.color = "#f87171";
+      errorLine.textContent = entry.hls.error;
+      container.appendChild(errorLine);
+    }
+  }
+
+  function renderChart(container, samples) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!samples.length) return;
+    const max = Math.max(...samples.map(sample => sample.duration || 0), 1);
+    samples.slice(0, 6).forEach(sample => {
+      const bar = document.createElement("span");
+      bar.style.height = `${Math.max(4, (sample.duration / max) * 24)}px`;
+      if (sample.duration > CONFIG.slowThreshold) {
+        bar.style.background = "rgba(251, 191, 36, 0.7)";
+      }
+      container.appendChild(bar);
     });
   }
 
@@ -644,6 +1234,7 @@
   function statusClass(entry) {
     if (entry.encrypted) return "encrypted";
     const status = String(entry.status || "");
+    if (status === "pending") return "pending";
     if (status === "ERR" || status.startsWith("4") || status.startsWith("5")) return "error";
     if (entry.lastDuration > CONFIG.slowThreshold) return "slow";
     if (entry.tag === "hls") return "streaming";
@@ -664,70 +1255,111 @@
     STATE.visible = false;
   }
 
-  function setupMutationObserver() {
-    if (mutationObserver) return;
-    mutationObserver = new MutationObserver(() => {
-      if (hud && !document.body.contains(hud)) {
-        document.body.appendChild(hud);
-      }
+  /* -------------------------------------------------------------------------- */
+  /*                                 Console Panel                              */
+  /* -------------------------------------------------------------------------- */
+
+  function createConsole() {
+    consolePanel = document.createElement("div");
+    consolePanel.id = "af-console";
+    consolePanel.innerHTML = `
+      <div class="topbar">
+        <div class="top-left">
+          <span>hyprNET Console</span>
+        </div>
+        <button id="af-console-close">Close</button>
+      </div>
+      <div class="divider"></div>
+      <div class="log-list" id="af-log-list"></div>
+      <div class="input-row">
+        <input id="af-console-input" type="text" placeholder="Run JS in page context..." />
+        <button id="af-console-run">Run</button>
+      </div>
+    `;
+    document.body.appendChild(consolePanel);
+
+    consolePanel.querySelector("#af-console-close")?.addEventListener("click", () => {
+      STATE.console.open = false;
+      renderConsole();
     });
-    mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+    consolePanel.querySelector("#af-console-run")?.addEventListener("click", runConsoleCommand);
+    consolePanel.querySelector("#af-console-input")?.addEventListener("keydown", event => {
+      if (event.key === "Enter") runConsoleCommand();
+    });
   }
 
-  /* ---------------- Command helpers ---------------- */
-
-  function headerFlags() {
-    const ua = navigator.userAgent.replace(/"/g, "\\\"");
-    return [
-      `--add-header "User-Agent:${ua}"`,
-      `--add-header "Referer:${location.href}"`,
-      `--add-header "Origin:${location.origin}"`,
-      `--cookies "cookies.txt"`
-    ].join(" ");
+  function renderConsole() {
+    if (!consolePanel) createConsole();
+    consolePanel.style.display = STATE.console.open ? "flex" : "none";
+    const list = consolePanel.querySelector("#af-log-list");
+    if (!list) return;
+    list.innerHTML = "";
+    STATE.console.logs.forEach(logEntry => {
+      const line = document.createElement("div");
+      line.className = `log-entry ${logEntry.level}`;
+      line.textContent = `[${logEntry.time}] ${logEntry.message} ${logEntry.data ? JSON.stringify(logEntry.data) : ""}`;
+      list.appendChild(line);
+    });
   }
 
-  function buildYtDlpCommand(url) {
-    return [
-      "yt-dlp",
-      headerFlags(),
-      "-f \"bestvideo+bestaudio/best\"",
-      "--merge-output-format mp4",
-      `-o \"${safeFilename()}_%(epoch)s.%(ext)s\"`,
-      `\"${url}\"`
-    ].join(" ");
+  function runConsoleCommand() {
+    const input = consolePanel.querySelector("#af-console-input");
+    if (!input || !input.value.trim()) return;
+    const code = input.value;
+    input.value = "";
+    try {
+      const result = window.eval(code);
+      log("warn", "Injected JS result", result);
+    } catch (error) {
+      log("error", "Injected JS error", error?.message || error);
+    }
   }
 
-  function buildAriaCommand(url) {
-    return [
-      "aria2c -x16 -s16 -k1M",
-      `--header=\"User-Agent:${navigator.userAgent}\"`,
-      `--header=\"Referer:${location.href}\"`,
-      `--header=\"Origin:${location.origin}\"`,
-      "--load-cookies=cookies.txt",
-      `\"${url}\"`
-    ].join(" ");
+  /* -------------------------------------------------------------------------- */
+  /*                               Discord Webhook                              */
+  /* -------------------------------------------------------------------------- */
+
+  async function maybeSendWebhook(entry) {
+    if (!CONFIG.discordWebhook) return;
+    const now = Date.now();
+    if (now - STATE.discordLastSent < CONFIG.discordRateLimitMs) return;
+    STATE.discordLastSent = now;
+
+    const payload = {
+      embeds: [
+        {
+          title: "hyprNET detection",
+          url: location.href,
+          color: entry.encrypted ? 0xf87171 : 0x38bdf8,
+          thumbnail: { url: "https://files.catbox.moe/cd88m5.png" },
+          fields: [
+            { name: "Media URL", value: entry.url || "unknown", inline: false },
+            { name: "Type", value: entry.tag || "unknown", inline: true },
+            { name: "Status", value: entry.status || "unknown", inline: true },
+            { name: "Locale", value: navigator.language || "n/a", inline: true }
+          ],
+          footer: {
+            text: new Date().toLocaleString()
+          }
+        }
+      ]
+    };
+
+    try {
+      await fetch(CONFIG.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      log("warn", "Discord webhook failed", error?.message || error);
+    }
   }
 
-  function buildHlsCommand(url) {
-    return [
-      "yt-dlp",
-      headerFlags(),
-      "--downloader ffmpeg",
-      "--downloader-args \"ffmpeg_i:-headers 'User-Agent: " + navigator.userAgent + "\\r\\nReferer: " + location.href + "\\r\\nOrigin: " + location.origin + "'\"",
-      "-f \"bv*+ba/b\"",
-      "--merge-output-format mp4",
-      `-o \"${safeFilename()}_%(epoch)s.%(ext)s\"`,
-      `\"${url}\"`
-    ].join(" ");
-  }
-
-  function safeFilename() {
-    return (STATE.title || location.hostname || "download")
-      .replace(/[\\/:*?"<>|]/g, "")
-      .slice(0, 60);
-  }
-
-  /* ---------------- Ping meter ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                 Ping Meter                                 */
+  /* -------------------------------------------------------------------------- */
 
   async function updatePing() {
     const el = document.getElementById("af-ping");
@@ -747,7 +1379,9 @@
     pingTimer = setInterval(updatePing, CONFIG.pingInterval);
   }
 
-  /* ---------------- Formatting ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                 Formatting                                 */
+  /* -------------------------------------------------------------------------- */
 
   function formatBytes(bytes) {
     if (!bytes) return "0 B";
@@ -771,13 +1405,29 @@
     return `${mbps.toFixed(2)} Mbps`;
   }
 
-  /* ---------------- Boot ---------------- */
+  /* -------------------------------------------------------------------------- */
+  /*                                   Boot                                     */
+  /* -------------------------------------------------------------------------- */
+
+  function setupMutationObserver() {
+    if (mutationObserver) return;
+    mutationObserver = new MutationObserver(() => {
+      if (hud && !document.body.contains(hud)) {
+        document.body.appendChild(hud);
+      }
+      if (consolePanel && !document.body.contains(consolePanel)) {
+        document.body.appendChild(consolePanel);
+      }
+    });
+    mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
 
   STATE.title = getTitle();
   hookNetwork();
   setupPerformanceObserver();
   setupMutationObserver();
-  toast("AstraFetch active (analysis-safe)");
+  setupMediaObserver();
+  toast("hyprNET active (analysis-safe)");
 
   document.addEventListener("keydown", event => {
     if (event.key !== CONFIG.triggerKey) return;
@@ -793,6 +1443,17 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && pingTimer) clearInterval(pingTimer);
     if (!document.hidden && STATE.visible) startPing();
+  });
+
+  window.addEventListener("error", event => {
+    if (!event?.error) return;
+    if (!isOurError(event.error)) return;
+    log("error", "Script error", event.error.message || event.error);
+  });
+
+  window.addEventListener("unhandledrejection", event => {
+    if (!isOurError(event.reason)) return;
+    log("error", "Unhandled rejection", event.reason?.message || event.reason);
   });
 
   showHUD();
