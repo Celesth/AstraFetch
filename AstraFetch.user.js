@@ -28,6 +28,7 @@
     pingInterval: 1500,
     overlayOutlineColor: "rgba(56, 189, 248, 0.6)",
     toastDuration: 2200,
+    includeCookies: false,
     discordWebhook: "", // optional webhook URL
     discordRateLimitMs: 15_000
   };
@@ -46,11 +47,13 @@
     cache: {
       seenUrls: new Map(),
       streamFingerprints: new Map(),
-      commandCache: new Map()
+      commandCache: new Map(),
+      probeCache: new Map()
     },
     console: {
       open: false,
-      logs: []
+      logs: [],
+      armed: false
     },
     media: {
       elements: new Set(),
@@ -478,7 +481,8 @@
     if (!clean) return null;
     const tag = classify(clean, initiator || source);
 
-    if (!STATE.entries.has(clean)) {
+    const isNew = !STATE.entries.has(clean);
+    if (isNew) {
       const created = {
         url: clean,
         tag,
@@ -487,6 +491,7 @@
         status: "pending",
         addedAt: Date.now(),
         count: 0,
+        seenCount: 1,
         failures: 0,
         totalDuration: 0,
         lastDuration: 0,
@@ -501,7 +506,9 @@
           variants: [],
           segments: [],
           error: null,
-          audioOnly: false
+          audioOnly: false,
+          live: false,
+          encryption: ""
         },
         probes: []
       };
@@ -528,7 +535,12 @@
       scheduleRender();
     }
 
-    return STATE.entries.get(clean);
+    const existing = STATE.entries.get(clean);
+    if (existing && !isNew) {
+      existing.seenCount += 1;
+      scheduleRender();
+    }
+    return existing;
   }
 
   function updateStatus(url, status) {
@@ -565,7 +577,7 @@
   /* -------------------------------------------------------------------------- */
 
   function hookNetwork() {
-    const _fetch = window.fetch;
+    const _fetch = window.fetch.bind(window);
     window.fetch = async (...args) => {
       const url = String(args[0]);
       const method = (args[1]?.method || "GET").toUpperCase();
@@ -585,6 +597,32 @@
         throw error;
       }
     };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || \"\");
+    return stack.includes(\"hyprNET\") || stack.includes(\"AstraFetch.user.js\");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function toast(text, duration = CONFIG.toastDuration) {
+    let el = document.getElementById("af-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "af-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), duration);
+  }
 
     const _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (_method, url) {
@@ -661,17 +699,21 @@
     entry.hls.error = null;
     updateStatus(entry.url, "analyzing");
     try {
-      const res = await fetch(entry.url, { credentials: "include" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      const parsed = parsePlaylist(text, entry.url);
+      const cached = STATE.cache.streamFingerprints.get(entry.url);
+      const parsed = cached || await fetchAndParsePlaylist(entry.url);
+      if (!cached) {
+        STATE.cache.streamFingerprints.set(entry.url, parsed);
+      }
       entry.hls.variants = parsed.variants;
       entry.hls.segments = parsed.segments;
       entry.hls.audioOnly = parsed.audioOnly;
+      entry.hls.live = parsed.live;
+      entry.hls.encryption = parsed.encryption;
       if (parsed.encrypted) {
         entry.encrypted = true;
         entry.status = "encrypted";
-        toast("Encrypted HLS detected via EXT-X-KEY.");
+        const method = parsed.encryption || "AES-128";
+        toast(`Encrypted HLS detected (${method}).`);
       } else {
         entry.status = "ok";
       }
@@ -685,16 +727,30 @@
     }
   }
 
+  async function fetchAndParsePlaylist(url) {
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    return parsePlaylist(text, url);
+  }
+
   function parsePlaylist(text, baseUrl) {
     const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
     const variants = [];
     const segments = [];
     let encrypted = false;
+    let encryption = "";
     let audioOnly = false;
+    let live = true;
 
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i];
-      if (line.startsWith("#EXT-X-KEY")) encrypted = true;
+      if (line.startsWith("#EXT-X-KEY")) {
+        encrypted = true;
+        const method = line.match(/METHOD=([^,]+)/i)?.[1] || "";
+        encryption = method || encryption;
+      }
+      if (line.startsWith("#EXT-X-ENDLIST")) live = false;
       if (line.startsWith("#EXT-X-STREAM-INF")) {
         const bandwidth = Number(line.match(/BANDWIDTH=(\d+)/i)?.[1] || 0);
         const resolution = line.match(/RESOLUTION=(\d+x\d+)/i)?.[1] || "";
@@ -717,12 +773,20 @@
       variants: variants.sort((a, b) => b.bandwidth - a.bandwidth),
       segments,
       encrypted,
-      audioOnly
+      encryption,
+      audioOnly,
+      live
     };
   }
 
   async function probeVariants(entry) {
     if (!entry) return;
+    const cached = STATE.cache.probeCache.get(entry.url);
+    if (cached) {
+      entry.probes = cached;
+      scheduleRender();
+      return;
+    }
     const candidates = entry.hls.variants.length
       ? entry.hls.variants.slice(0, 5).map(variant => ({
         url: variant.url,
@@ -738,13 +802,20 @@
     await Promise.all(
       probes.map(async probe => {
         try {
-          const res = await fetch(probe.url, { method: "HEAD" });
+          let res = await fetch(probe.url, { method: "HEAD" });
+          if (!res.ok) {
+            res = await fetch(probe.url, {
+              method: "GET",
+              headers: { Range: "bytes=0-1023" }
+            });
+          }
           probe.status = res.ok ? "ok" : `HTTP ${res.status}`;
         } catch {
           probe.status = "blocked";
         }
       })
     );
+    STATE.cache.probeCache.set(entry.url, probes);
     scheduleRender();
   }
 
@@ -783,7 +854,15 @@
 
   function setupMediaObserver() {
     if (mediaObserver) return;
-    mediaObserver = new MutationObserver(scanMediaElements);
+    let scheduled = false;
+    mediaObserver = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        scanMediaElements();
+      });
+    });
     mediaObserver.observe(document.documentElement, { childList: true, subtree: true });
     scanMediaElements();
   }
@@ -793,9 +872,14 @@
     elements.forEach(element => {
       if (STATE.media.elements.has(element)) return;
       STATE.media.elements.add(element);
-      element.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
-      element.addEventListener("mouseenter", () => showMediaOverlay(element));
-      element.addEventListener("mouseleave", hideMediaOverlay);
+      element.addEventListener("mouseenter", () => {
+        element.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
+        showMediaOverlay(element);
+      });
+      element.addEventListener("mouseleave", () => {
+        element.style.outline = "";
+        hideMediaOverlay();
+      });
     });
   }
 
@@ -822,8 +906,11 @@
           : "yt-dlp";
       handleOverlayAction(defaultAction, info);
     };
-    overlay.style.top = `${rect.top + rect.height / 2 - 60}px`;
-    overlay.style.left = `${rect.left + rect.width / 2 - 140}px`;
+    const desiredTop = rect.top + rect.height / 2 - 60;
+    const desiredLeft = rect.left + rect.width / 2 - 140;
+    const clamped = clampToViewport(desiredLeft, desiredTop, overlay);
+    overlay.style.top = `${clamped.top}px`;
+    overlay.style.left = `${clamped.left}px`;
     overlay.style.display = "block";
     STATE.media.activeElement = element;
 
@@ -838,6 +925,17 @@
   function hideMediaOverlay() {
     const overlay = STATE.media.overlay;
     if (overlay) overlay.style.display = "none";
+  }
+
+  function clampToViewport(left, top, element) {
+    const { innerWidth, innerHeight } = window;
+    const rect = element.getBoundingClientRect();
+    const width = rect.width || 280;
+    const height = rect.height || 140;
+    return {
+      left: Math.min(Math.max(8, left), innerWidth - width - 8),
+      top: Math.min(Math.max(8, top), innerHeight - height - 8)
+    };
   }
 
   function getMediaOverlay() {
@@ -903,7 +1001,9 @@
 
   function headerFlags() {
     const ua = navigator.userAgent.replace(/"/g, "\\\"");
-    const cookie = document.cookie ? `--add-header "Cookie:${document.cookie}"` : "--cookies \"cookies.txt\"";
+    const cookie = CONFIG.includeCookies && document.cookie
+      ? `--add-header "Cookie:${document.cookie}"`
+      : "--cookies \"cookies.txt\"";
     return [
       `--add-header "User-Agent:${ua}"`,
       `--add-header "Referer:${location.href}"`,
@@ -936,7 +1036,7 @@
       `--header=\"User-Agent:${navigator.userAgent}\"`,
       `--header=\"Referer:${location.href}\"`,
       `--header=\"Origin:${location.origin}\"`,
-      document.cookie ? `--header=\"Cookie:${document.cookie}\"` : "--load-cookies=cookies.txt",
+      CONFIG.includeCookies && document.cookie ? `--header=\"Cookie:${document.cookie}\"` : "--load-cookies=cookies.txt",
       `\"${url}\"`
     ].join(" ");
     STATE.cache.commandCache.set(key, cmd);
@@ -966,7 +1066,7 @@
     const cmd = [
       "ffmpeg",
       `-headers \"User-Agent: ${navigator.userAgent}\\r\\nReferer: ${location.href}\\r\\nOrigin: ${location.origin}\"`,
-      document.cookie ? `-headers \"Cookie: ${document.cookie}\"` : "",
+      CONFIG.includeCookies && document.cookie ? `-headers \"Cookie: ${document.cookie}\"` : "",
       `-i \"${url}\"`,
       "-c copy",
       `\"${safeFilename()}_%(epoch)s.mp4\"`
@@ -1061,7 +1161,7 @@
             <div class="row-head">
               <span class="tag ${entry.tag}">${entry.tag}</span>
               <span class="url" title="${entry.url}">${entry.url}</span>
-              <span class="status">${entry.status}</span>
+              <span class="status">${entry.status}${entry.seenCount > 1 ? ` ×${entry.seenCount}` : ""}</span>
             </div>
             <div class="meta">
               <div>${entry.method} · ${entry.source}</div>
@@ -1069,9 +1169,10 @@
               <div>${formatDuration(entry.lastDuration)} last</div>
               <div>${entry.count} hits · ${formatDuration(entry.totalDuration / (entry.count || 1))} avg</div>
               <div>${formatBitrate(entry.bitrate)}</div>
-          <div>${entry.encrypted ? "encrypted" : entry.hls.audioOnly ? "audio-only" : ""}</div>
-          <div>${entry.failures} fails</div>
-          <div>${entry.hls.segments.length ? `${entry.hls.segments.length} segments` : ""}</div>
+              <div>${entry.encrypted ? entry.hls.encryption || "encrypted" : entry.hls.audioOnly ? "audio-only" : ""}</div>
+              <div>${entry.hls.live ? "live" : entry.hls.segments.length ? "vod" : ""}</div>
+              <div>${entry.failures} fails</div>
+              <div>${entry.hls.segments.length ? `${entry.hls.segments.length} segments` : ""}</div>
             </div>
             <div class="chart"></div>
             <div class="actions"></div>
@@ -1166,6 +1267,13 @@
       }
       container.appendChild(line);
     });
+
+    if (entry.samples.length) {
+      const history = document.createElement("div");
+      history.style.color = "#9ca3af";
+      history.textContent = `Status history: ${entry.samples.map(sample => sample.status).join(" → ")}`;
+      container.appendChild(history);
+    }
 
     if (entry.hls.variants.length) {
       const variantHeader = document.createElement("div");
@@ -1267,7 +1375,10 @@
         <div class="top-left">
           <span>hyprNET Console</span>
         </div>
-        <button id="af-console-close">Close</button>
+        <div>
+          <button id="af-console-arm">Arm</button>
+          <button id="af-console-close">Close</button>
+        </div>
       </div>
       <div class="divider"></div>
       <div class="log-list" id="af-log-list"></div>
@@ -1283,6 +1394,11 @@
       renderConsole();
     });
 
+    consolePanel.querySelector("#af-console-arm")?.addEventListener("click", () => {
+      STATE.console.armed = !STATE.console.armed;
+      renderConsole();
+    });
+
     consolePanel.querySelector("#af-console-run")?.addEventListener("click", runConsoleCommand);
     consolePanel.querySelector("#af-console-input")?.addEventListener("keydown", event => {
       if (event.key === "Enter") runConsoleCommand();
@@ -1292,6 +1408,11 @@
   function renderConsole() {
     if (!consolePanel) createConsole();
     consolePanel.style.display = STATE.console.open ? "flex" : "none";
+    const armButton = consolePanel.querySelector("#af-console-arm");
+    if (armButton) {
+      armButton.textContent = STATE.console.armed ? "Armed" : "Arm";
+      armButton.style.borderColor = STATE.console.armed ? "rgba(34, 197, 94, 0.6)" : "#1e1e22";
+    }
     const list = consolePanel.querySelector("#af-log-list");
     if (!list) return;
     list.innerHTML = "";
@@ -1306,6 +1427,10 @@
   function runConsoleCommand() {
     const input = consolePanel.querySelector("#af-console-input");
     if (!input || !input.value.trim()) return;
+    if (!STATE.console.armed) {
+      toast("Arm console before running code.");
+      return;
+    }
     const code = input.value;
     input.value = "";
     try {
@@ -1314,6 +1439,8 @@
     } catch (error) {
       log("error", "Injected JS error", error?.message || error);
     }
+    STATE.console.armed = false;
+    renderConsole();
   }
 
   /* -------------------------------------------------------------------------- */
@@ -1325,6 +1452,8 @@
     const now = Date.now();
     if (now - STATE.discordLastSent < CONFIG.discordRateLimitMs) return;
     STATE.discordLastSent = now;
+    const locale = navigator.language || "n/a";
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "n/a";
 
     const payload = {
       embeds: [
@@ -1334,10 +1463,11 @@
           color: entry.encrypted ? 0xf87171 : 0x38bdf8,
           thumbnail: { url: "https://files.catbox.moe/cd88m5.png" },
           fields: [
-            { name: "Media URL", value: entry.url || "unknown", inline: false },
+            { name: "Page", value: STATE.title || document.title || location.hostname, inline: false },
+            { name: "Media URL", value: sanitizeUrl(entry.url) || "unknown", inline: false },
             { name: "Type", value: entry.tag || "unknown", inline: true },
             { name: "Status", value: entry.status || "unknown", inline: true },
-            { name: "Locale", value: navigator.language || "n/a", inline: true }
+            { name: "Locale", value: `${locale} · ${timeZone}`, inline: true }
           ],
           footer: {
             text: new Date().toLocaleString()
@@ -1354,6 +1484,16 @@
       });
     } catch (error) {
       log("warn", "Discord webhook failed", error?.message || error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
     }
   }
 
@@ -1411,13 +1551,19 @@
 
   function setupMutationObserver() {
     if (mutationObserver) return;
+    let scheduled = false;
     mutationObserver = new MutationObserver(() => {
-      if (hud && !document.body.contains(hud)) {
-        document.body.appendChild(hud);
-      }
-      if (consolePanel && !document.body.contains(consolePanel)) {
-        document.body.appendChild(consolePanel);
-      }
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        if (hud && !document.body.contains(hud)) {
+          document.body.appendChild(hud);
+        }
+        if (consolePanel && !document.body.contains(consolePanel)) {
+          document.body.appendChild(consolePanel);
+        }
+      });
     });
     mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
