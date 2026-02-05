@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         AstraFetch (M3U8 + Blob)
+// @name         AstraFetch (Stream Analyzer)
 // @namespace    https://github.com/Celesth/AstraFetch
 // @icon         https://cdn.discordapp.com/attachments/1399627953977167902/1465377210037698827/Screenshot_2026-01-26-21-26-16-532_com.miui.mediaviewer.png
-// @version      0.4.0
-// @description  M3U8/Blob detector + in-browser downloader HUD
+// @version      0.4.1
+// @description  M3U8/blob analyzer HUD with resource timing stats
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
@@ -21,7 +21,8 @@
     width: 520,
     height: 320,
     maxEntries: 200,
-    maxConcurrency: 6,
+    maxSamples: 6,
+    slowThreshold: 800,
     toastDuration: 2200
   };
 
@@ -141,6 +142,22 @@
       flex-wrap: wrap;
     }
 
+    #af-hud .meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      font-size: 0.65rem;
+      color: #9ca3af;
+    }
+
+    #af-hud .samples {
+      margin-left: 8px;
+      display: grid;
+      gap: 4px;
+      font-size: 0.62rem;
+      color: #cbd5f5;
+    }
+
     #af-hud button {
       border: 1px solid #1e1e22;
       background: #141414;
@@ -230,27 +247,42 @@
     });
   }
 
-  function addEntry(url, source = "network") {
+  function addEntry(url, source = "network", method = "GET") {
     const clean = normalizeUrl(url);
     if (!clean) return;
     const tag = classify(clean);
     if (tag === "other") return;
 
     if (!STATE.entries.has(clean)) {
-      STATE.entries.set(clean, {
+      const created = {
         url: clean,
         tag,
         source,
+        method,
         status: "idle",
-        addedAt: Date.now()
-      });
+        addedAt: Date.now(),
+        count: 0,
+        totalDuration: 0,
+        lastDuration: 0,
+        totalTransfer: 0,
+        bitrate: null,
+        samples: [],
+        open: false,
+        warned: false
+      };
+      STATE.entries.set(clean, created);
       if (STATE.entries.size > CONFIG.maxEntries) {
         const oldest = STATE.entries.keys().next().value;
         STATE.entries.delete(oldest);
       }
       toast(`Detected ${tag.toUpperCase()}`);
+      if (tag === "m3u8" && !created.warned) {
+        created.warned = true;
+        toast("M3U8 detected. Encrypted playlists require external tools.");
+      }
       scheduleRender();
     }
+    return STATE.entries.get(clean);
   }
 
   /* ---------------- Network Hook ---------------- */
@@ -258,14 +290,41 @@
   function hookNetwork() {
     const _fetch = window.fetch;
     window.fetch = async (...args) => {
-      addEntry(String(args[0]));
-      return _fetch(...args);
+      const url = String(args[0]);
+      const method = (args[1]?.method || "GET").toUpperCase();
+      const entry = addEntry(url, "fetch", method);
+      const start = performance.now();
+      try {
+        const res = await _fetch(...args);
+        const duration = performance.now() - start;
+        updateStatus(url, `${res.status}`);
+        updateSample(entry, duration, 0, res.status);
+        return res;
+      } catch (error) {
+        const duration = performance.now() - start;
+        updateStatus(url, "ERR");
+        updateSample(entry, duration, 0, "ERR");
+        throw error;
+      }
     };
 
     const _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (_method, url) {
-      addEntry(String(url));
+      this._afMeta = { url: String(url), method: String(_method || "GET").toUpperCase(), start: 0 };
+      addEntry(String(url), "xhr", this._afMeta.method);
       return _open.apply(this, arguments);
+    };
+
+    const _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function () {
+      if (this._afMeta) this._afMeta.start = performance.now();
+      this.addEventListener("loadend", () => {
+        if (!this._afMeta) return;
+        const duration = performance.now() - this._afMeta.start;
+        updateStatus(this._afMeta.url, `${this.status || "ERR"}`);
+        updateSample(STATE.entries.get(normalizeUrl(this._afMeta.url)), duration, 0, this.status || "ERR");
+      });
+      return _send.apply(this, arguments);
     };
   }
 
@@ -281,7 +340,7 @@
             <span>AstraFetch</span>
             <span>${CONFIG.triggerKey} to toggle</span>
           </div>
-          <div class="subtitle">Detected M3U8 + Blob streams</div>
+          <div class="subtitle">Analysis-only mode (no media fetching)</div>
         </div>
         <div class="divider"></div>
         <div class="rows" id="af-rows"></div>
@@ -318,7 +377,15 @@
           <span class="url" title="${entry.url}">${entry.url}</span>
           <span class="status">${entry.status}</span>
         </div>
+        <div class="meta">
+          <div>${entry.method} · ${entry.source}</div>
+          <div>${formatBytes(entry.totalTransfer)} total</div>
+          <div>${formatDuration(entry.lastDuration)} last</div>
+          <div>${entry.count} hits · ${formatDuration(entry.totalDuration / (entry.count || 1))} avg</div>
+          <div>${formatBitrate(entry.bitrate)}</div>
+        </div>
         <div class="actions"></div>
+        <div class="samples" style="display:${entry.open ? "grid" : "none"};"></div>
       `;
 
       const actions = row.querySelector(".actions");
@@ -330,17 +397,23 @@
 
         actions.appendChild(copy);
 
-        if (entry.tag === "m3u8") {
-          actions.appendChild(
-            makeButton("Download M3U8", () => downloadM3U8(entry))
-          );
-        }
+        const toggle = makeButton(entry.open ? "Hide Samples" : "Show Samples", () => {
+          entry.open = !entry.open;
+          renderRows();
+        });
+        actions.appendChild(toggle);
+      }
 
-        if (entry.tag === "blob" || entry.tag === "media") {
-          actions.appendChild(
-            makeButton("Download Blob", () => downloadBlob(entry))
-          );
-        }
+      const samples = row.querySelector(".samples");
+      if (samples && entry.open) {
+        entry.samples.forEach(sample => {
+          const line = document.createElement("div");
+          line.textContent = `${formatDuration(sample.duration)} · ${formatBytes(sample.transfer)} · ${sample.status}`;
+          if (sample.duration > CONFIG.slowThreshold) {
+            line.style.color = "#fbbf24";
+          }
+          samples.appendChild(line);
+        });
       }
 
       container.appendChild(row);
@@ -367,175 +440,66 @@
     STATE.visible = false;
   }
 
-  /* ---------------- Download Logic ---------------- */
+  /* ---------------- Resource Timing ---------------- */
 
-  async function downloadBlob(entry) {
-    updateStatus(entry.url, "fetching");
-    try {
-      const res = await fetch(entry.url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const ext = blob.type.includes("mp4") ? "mp4" : "bin";
-      triggerDownload(blob, `${STATE.title || "download"}.${ext}`);
-      updateStatus(entry.url, "done");
-    } catch (error) {
-      updateStatus(entry.url, "failed");
-      toast(`Blob download failed: ${error.message}`);
-    }
-  }
-
-  async function downloadM3U8(entry) {
-    updateStatus(entry.url, "loading playlist");
-    try {
-      const playlistUrl = entry.url;
-      const playlistText = await fetchText(playlistUrl);
-      const parsed = parsePlaylist(playlistText, playlistUrl);
-
-      if (parsed.isMaster && parsed.selectedUrl) {
-        updateStatus(entry.url, "selecting variant");
-        const childEntry = { url: parsed.selectedUrl };
-        await downloadM3U8(childEntry);
-        updateStatus(entry.url, "done");
-        return;
-      }
-
-      if (parsed.hasKey) {
-        updateStatus(entry.url, "encrypted");
-        toast("Playlist uses AES-128 (EXT-X-KEY). Browser-only merge not supported.");
-        return;
-      }
-
-      if (!parsed.segments.length) {
-        updateStatus(entry.url, "no segments");
-        toast("No media segments found in playlist.");
-        return;
-      }
-
-      updateStatus(entry.url, `downloading 0/${parsed.segments.length}`);
-      const buffers = await fetchSegments(parsed, (done, total) => {
-        updateStatus(entry.url, `downloading ${done}/${total}`);
+  function setupPerformanceObserver() {
+    if (!("PerformanceObserver" in window)) return;
+    const observer = new PerformanceObserver(list => {
+      list.getEntries().forEach(entry => {
+        if (entry.entryType !== "resource") return;
+        const url = normalizeUrl(entry.name);
+        const tracked = addEntry(url, entry.initiatorType || "resource");
+        if (!tracked) return;
+        const transfer = entry.transferSize || 0;
+        updateSample(tracked, entry.duration, transfer, tracked.status);
       });
-
-      const blob = new Blob(buffers, {
-        type: parsed.isFmp4 ? "video/mp4" : "video/mp2t"
-      });
-      const filename = `${STATE.title || "download"}.${parsed.isFmp4 ? "mp4" : "ts"}`;
-      triggerDownload(blob, filename);
-      updateStatus(entry.url, "done");
-    } catch (error) {
-      updateStatus(entry.url, "failed");
-      toast(`M3U8 download failed: ${error.message}`);
-    }
-  }
-
-  async function fetchText(url) {
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.text();
-  }
-
-  function parsePlaylist(text, playlistUrl) {
-    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-    const isMaster = lines.some(line => line.startsWith("#EXT-X-STREAM-INF"));
-    const hasKey = lines.some(line => line.startsWith("#EXT-X-KEY"));
-
-    if (isMaster) {
-      const variants = [];
-      for (let i = 0; i < lines.length; i += 1) {
-        if (lines[i].startsWith("#EXT-X-STREAM-INF")) {
-          const match = lines[i].match(/BANDWIDTH=(\d+)/i);
-          const bandwidth = match ? Number(match[1]) : 0;
-          const uri = lines[i + 1] && !lines[i + 1].startsWith("#") ? lines[i + 1] : null;
-          if (uri) {
-            variants.push({
-              bandwidth,
-              url: new URL(uri, playlistUrl).href
-            });
-          }
-        }
-      }
-      variants.sort((a, b) => b.bandwidth - a.bandwidth);
-      return {
-        isMaster: true,
-        selectedUrl: variants[0]?.url,
-        segments: [],
-        hasKey: false,
-        isFmp4: false,
-        initSegment: null
-      };
-    }
-
-    let initSegment = null;
-    let isFmp4 = false;
-    const segments = [];
-
-    for (const line of lines) {
-      if (line.startsWith("#EXT-X-MAP")) {
-        const match = line.match(/URI="([^"]+)"/i);
-        if (match) {
-          initSegment = new URL(match[1], playlistUrl).href;
-          isFmp4 = true;
-        }
-      }
-      if (!line.startsWith("#")) {
-        const resolved = new URL(line, playlistUrl).href;
-        segments.push(resolved);
-        if (line.includes(".m4s") || line.includes(".mp4")) {
-          isFmp4 = true;
-        }
-      }
-    }
-
-    return {
-      isMaster: false,
-      selectedUrl: null,
-      segments,
-      hasKey,
-      isFmp4,
-      initSegment
-    };
-  }
-
-  async function fetchSegments(parsed, onProgress) {
-    const urls = [...parsed.segments];
-    const buffers = [];
-
-    if (parsed.initSegment) {
-      const initRes = await fetch(parsed.initSegment);
-      if (!initRes.ok) throw new Error(`Init HTTP ${initRes.status}`);
-      buffers.push(await initRes.arrayBuffer());
-    }
-
-    let index = 0;
-    const results = new Array(urls.length);
-    const workers = Array.from({ length: CONFIG.maxConcurrency }, async () => {
-      while (index < urls.length) {
-        const current = index;
-        index += 1;
-        const res = await fetch(urls[current]);
-        if (!res.ok) throw new Error(`Segment HTTP ${res.status}`);
-        results[current] = await res.arrayBuffer();
-        onProgress(current + 1, urls.length);
-      }
     });
-
-    await Promise.all(workers);
-    return buffers.concat(results);
+    observer.observe({ entryTypes: ["resource"] });
   }
 
-  function triggerDownload(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+  function updateSample(entry, duration, transfer, status) {
+    if (!entry) return;
+    entry.count += 1;
+    entry.totalDuration += duration;
+    entry.totalTransfer += transfer;
+    entry.lastDuration = duration;
+    entry.status = status || entry.status;
+    if (transfer && duration) {
+      entry.bitrate = ((transfer * 8) / (duration / 1000)) / 1e6;
+    }
+    entry.samples.unshift({
+      duration,
+      transfer,
+      status
+    });
+    if (entry.samples.length > CONFIG.maxSamples) entry.samples.pop();
+    scheduleRender();
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let idx = 0;
+    let value = bytes;
+    while (value >= 1024 && idx < units.length - 1) {
+      value /= 1024;
+      idx += 1;
+    }
+    return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+  }
+
+  function formatDuration(ms) {
+    if (!ms) return "0ms";
+    return `${Math.round(ms)}ms`;
+  }
+
+  function formatBitrate(mbps) {
+    if (!mbps) return "bitrate n/a";
+    return `${mbps.toFixed(2)} Mbps`;
   }
 
   function updateStatus(url, status) {
-    const entry = STATE.entries.get(url);
+    const entry = STATE.entries.get(normalizeUrl(url));
     if (!entry) return;
     entry.status = status;
     scheduleRender();
@@ -545,7 +509,8 @@
 
   STATE.title = getTitle();
   hookNetwork();
-  toast("AstraFetch active");
+  setupPerformanceObserver();
+  toast("AstraFetch active (analysis-only)");
 
   document.addEventListener("keydown", event => {
     if (event.key !== CONFIG.triggerKey) return;
