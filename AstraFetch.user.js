@@ -597,6 +597,32 @@
         throw error;
       }
     };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || \"\");
+    return stack.includes(\"hyprNET\") || stack.includes(\"AstraFetch.user.js\");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function toast(text, duration = CONFIG.toastDuration) {
+    let el = document.getElementById("af-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "af-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), duration);
+  }
 
     const _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (_method, url) {
