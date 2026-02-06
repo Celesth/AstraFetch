@@ -40,6 +40,9 @@
   const STATE = {
     title: null,
     visible: false,
+    ui: {
+      ready: false
+    },
     entries: new Map(),
     needsRender: false,
     groupState: new Map(),
@@ -58,7 +61,8 @@
     media: {
       elements: new Set(),
       overlay: null,
-      activeElement: null
+      activeElement: null,
+      handlers: new WeakMap()
     },
     lastHlsUrl: null,
     discordLastSent: 0
@@ -462,7 +466,7 @@
     if (STATE.needsRender) return;
     STATE.needsRender = true;
     requestAnimationFrame(() => {
-      if (STATE.visible) renderRows();
+      if (STATE.visible && STATE.ui.ready) renderRows();
       STATE.needsRender = false;
     });
   }
@@ -489,6 +493,7 @@
         source,
         method,
         status: "pending",
+        finalized: false,
         addedAt: Date.now(),
         count: 0,
         seenCount: 1,
@@ -547,6 +552,7 @@
     const entry = STATE.entries.get(normalizeUrl(url));
     if (!entry) return;
     entry.status = status;
+    entry.finalized = status !== "pending" && status !== "analyzing";
     scheduleRender();
   }
 
@@ -597,32 +603,6 @@
         throw error;
       }
     };
-    STATE.console.logs.unshift(entry);
-    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
-    renderConsole();
-  }
-
-  function isOurError(error) {
-    if (!error) return false;
-    const stack = String(error.stack || \"\");
-    return stack.includes(\"hyprNET\") || stack.includes(\"AstraFetch.user.js\");
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*                                     Utils                                  */
-  /* -------------------------------------------------------------------------- */
-
-  function toast(text, duration = CONFIG.toastDuration) {
-    let el = document.getElementById("af-toast");
-    if (!el) {
-      el = document.createElement("div");
-      el.id = "af-toast";
-      document.body.appendChild(el);
-    }
-    el.textContent = text;
-    el.classList.add("show");
-    setTimeout(() => el.classList.remove("show"), duration);
-  }
 
     const _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (_method, url) {
@@ -656,13 +636,17 @@
   function setupPerformanceObserver() {
     if (!("PerformanceObserver" in window)) return;
     const observer = new PerformanceObserver(list => {
+      if (!STATE.ui.ready) return;
       list.getEntries().forEach(entry => {
         if (entry.entryType !== "resource") return;
         const url = normalizeUrl(entry.name);
         const tracked = addEntry(url, entry.initiatorType || "resource", "GET", entry.initiatorType);
         if (!tracked) return;
-        const transfer = entry.transferSize || 0;
-        updateSample(tracked, entry.duration, transfer, tracked.status);
+        const size = entry.transferSize || entry.encodedBodySize || 0;
+        if (!size) {
+          tracked.status = tracked.status === "pending" ? "unknown" : tracked.status;
+        }
+        updateSample(tracked, entry.duration || 0, size, tracked.status);
         if (url.includes(".key")) {
           markEncryptedByOrigin(url);
         }
@@ -714,6 +698,8 @@
         entry.status = "encrypted";
         const method = parsed.encryption || "AES-128";
         toast(`Encrypted HLS detected (${method}).`);
+        updateStatus(entry.url, "encrypted");
+        return;
       } else {
         entry.status = "ok";
       }
@@ -749,6 +735,10 @@
         encrypted = true;
         const method = line.match(/METHOD=([^,]+)/i)?.[1] || "";
         encryption = method || encryption;
+      }
+      if (line.startsWith("#EXT-X-MAP")) {
+        encrypted = true;
+        encryption = encryption || "EXT-X-MAP";
       }
       if (line.startsWith("#EXT-X-ENDLIST")) live = false;
       if (line.startsWith("#EXT-X-STREAM-INF")) {
@@ -856,6 +846,7 @@
     if (mediaObserver) return;
     let scheduled = false;
     mediaObserver = new MutationObserver(() => {
+      if (!STATE.ui.ready) return;
       if (scheduled) return;
       scheduled = true;
       requestAnimationFrame(() => {
@@ -872,18 +863,27 @@
     elements.forEach(element => {
       if (STATE.media.elements.has(element)) return;
       STATE.media.elements.add(element);
-      element.addEventListener("mouseenter", () => {
+      const onEnter = () => {
+        if (!element || element.readyState < 1) return;
         element.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
         showMediaOverlay(element);
-      });
-      element.addEventListener("mouseleave", () => {
+      };
+      const onLeave = () => {
         element.style.outline = "";
         hideMediaOverlay();
-      });
+      };
+      const onLoaded = () => {
+        element.style.outline = "";
+      };
+      element.addEventListener("mouseenter", onEnter);
+      element.addEventListener("mouseleave", onLeave);
+      element.addEventListener("loadedmetadata", onLoaded);
+      STATE.media.handlers.set(element, { onEnter, onLeave, onLoaded });
     });
   }
 
   function showMediaOverlay(element) {
+    if (!element || element.readyState < 1) return;
     const overlay = getMediaOverlay();
     const rect = element.getBoundingClientRect();
     const info = getMediaInfo(element);
@@ -898,7 +898,8 @@
         <button data-action="aria2">aria2c</button>
       </div>
     `;
-    overlay.onclick = () => {
+    overlay.onclick = event => {
+      if (event.target.closest("button")) return;
       const defaultAction = info.tag === "hls"
         ? "yt-dlp"
         : isDirectFile(info.url)
@@ -948,6 +949,14 @@
   }
 
   function getMediaInfo(element) {
+    if (!element || element.readyState < 1) {
+      return {
+        url: "unknown",
+        type: "media",
+        stats: "metadata pending",
+        tag: "media"
+      };
+    }
     const src = element.currentSrc || element.src ||
       element.querySelector("source")?.src || "unknown";
     const url = src.startsWith("blob:") && STATE.lastHlsUrl ? STATE.lastHlsUrl : src;
@@ -1206,6 +1215,14 @@
         toast("URL copied");
       })
     );
+
+    if (!entry.finalized) {
+      const wait = document.createElement("div");
+      wait.style.color = "#9ca3af";
+      wait.textContent = "waiting for request...";
+      container.appendChild(wait);
+      return;
+    }
 
     if (entry.tag === "media") {
       container.appendChild(
@@ -1475,6 +1492,32 @@
         }
       ]
     };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || "");
+    return stack.includes("hyprNET") || stack.includes("AstraFetch.user.js");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function toast(text, duration = CONFIG.toastDuration) {
+    let el = document.getElementById("af-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "af-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), duration);
+  }
 
     try {
       await fetch(CONFIG.discordWebhook, {
@@ -1552,7 +1595,10 @@
   function setupMutationObserver() {
     if (mutationObserver) return;
     let scheduled = false;
-    mutationObserver = new MutationObserver(() => {
+    mutationObserver = new MutationObserver(mutations => {
+      if (!STATE.ui.ready) return;
+      const hasAdditions = mutations.some(mutation => mutation.addedNodes && mutation.addedNodes.length);
+      if (!hasAdditions) return;
       if (scheduled) return;
       scheduled = true;
       requestAnimationFrame(() => {
@@ -1568,11 +1614,47 @@
     mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  function teardownObservers() {
+    mutationObserver?.disconnect();
+    mediaObserver?.disconnect();
+    mutationObserver = null;
+    mediaObserver = null;
+  }
+
+  function resetState() {
+    STATE.entries.clear();
+    STATE.groupState.clear();
+    STATE.media.elements.clear();
+    STATE.media.handlers = new WeakMap();
+    STATE.lastHlsUrl = null;
+    STATE.encryptedDetected = false;
+    STATE.cache.seenUrls.clear();
+    scheduleRender();
+  }
+
+  function initUi() {
+    if (!hud) createHUD();
+    if (!consolePanel) createConsole();
+    STATE.ui.ready = true;
+    showHUD();
+  }
+
+  function initObserversAndHooks() {
+    setupPerformanceObserver();
+    setupMutationObserver();
+    setupMediaObserver();
+    hookNetwork();
+  }
+
+  function handleNavigationChange() {
+    teardownObservers();
+    resetState();
+    initObserversAndHooks();
+  }
+
   STATE.title = getTitle();
-  hookNetwork();
-  setupPerformanceObserver();
-  setupMutationObserver();
-  setupMediaObserver();
+  initUi();
+  initObserversAndHooks();
   toast("hyprNET active (analysis-safe)");
 
   document.addEventListener("keydown", event => {
@@ -1589,7 +1671,21 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && pingTimer) clearInterval(pingTimer);
     if (!document.hidden && STATE.visible) startPing();
+    if (document.hidden) {
+      mediaObserver?.disconnect();
+    } else {
+      mediaObserver = null;
+      setupMediaObserver();
+    }
   });
+
+  window.addEventListener("popstate", handleNavigationChange);
+
+  const originalPushState = history.pushState;
+  history.pushState = function (...args) {
+    originalPushState.apply(this, args);
+    handleNavigationChange();
+  };
 
   window.addEventListener("error", event => {
     if (!event?.error) return;
@@ -1602,6 +1698,5 @@
     log("error", "Unhandled rejection", event.reason?.message || event.reason);
   });
 
-  showHUD();
   startPing();
 })();
