@@ -1497,6 +1497,96 @@
         }
       ]
     };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || "");
+    return stack.includes("hyprNET") || stack.includes("AstraFetch.user.js");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function toast(text, duration = CONFIG.toastDuration) {
+    let el = document.getElementById("af-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "af-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), duration);
+  }
+
+    try {
+      await fetch(CONFIG.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      log("warn", "Discord webhook failed", error?.message || error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
+  }
+
+    try {
+      await fetch(CONFIG.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      log("warn", "Discord webhook failed", error?.message || error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                 Ping Meter                                 */
+  /* -------------------------------------------------------------------------- */
+
+  async function updatePing() {
+    const el = document.getElementById("af-ping");
+    if (!el) return;
+    const start = performance.now();
+    try {
+      await fetch(location.origin, { method: "HEAD", cache: "no-store" });
+      const ms = Math.round(performance.now() - start);
+      el.textContent = `ping ${ms}ms`;
+    } catch {
+      el.textContent = "ping blocked";
+    }
+  }
+
+  function startPing() {
+    updatePing();
+    pingTimer = setInterval(updatePing, CONFIG.pingInterval);
+  }
 
     try {
       await fetch(CONFIG.discordWebhook, {
