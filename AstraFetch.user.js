@@ -639,6 +639,8 @@
     if (performanceObserver) return;
     performanceObserver = new PerformanceObserver(list => {
       if (!STATE.ui.ready || !STATE.visible) return;
+    const observer = new PerformanceObserver(list => {
+      if (!STATE.ui.ready) return;
       list.getEntries().forEach(entry => {
         if (entry.entryType !== "resource") return;
         const url = normalizeUrl(entry.name);
@@ -655,6 +657,7 @@
       });
     });
     performanceObserver.observe({ entryTypes: ["resource"] });
+    observer.observe({ entryTypes: ["resource"] });
   }
 
   function markEncryptedByOrigin(keyUrl) {
@@ -849,6 +852,7 @@
     let scheduled = false;
     mediaObserver = new MutationObserver(() => {
       if (!STATE.ui.ready || !STATE.visible) return;
+      if (!STATE.ui.ready) return;
       if (scheduled) return;
       scheduled = true;
       requestAnimationFrame(() => {
@@ -1411,6 +1415,8 @@
       <div class="input-row">
         <input id="af-console-input" type="text" placeholder="Copy JS payload (execution disabled)" />
         <button id="af-console-run">Copy</button>
+        <input id="af-console-input" type="text" placeholder="Run JS in page context..." />
+        <button id="af-console-run">Run</button>
       </div>
     `;
     document.body.appendChild(consolePanel);
@@ -1461,6 +1467,12 @@
     input.value = "";
     safeClipboard(code);
     log("warn", "Injection disabled by policy; code copied to clipboard.");
+    try {
+      const result = window.eval(code);
+      log("warn", "Injected JS result", result);
+    } catch (error) {
+      log("error", "Injected JS error", error?.message || error);
+    }
     STATE.console.armed = false;
     renderConsole();
   }
@@ -1497,6 +1509,53 @@
         }
       ]
     };
+    STATE.console.logs.unshift(entry);
+    if (STATE.console.logs.length > 100) STATE.console.logs.pop();
+    renderConsole();
+  }
+
+  function isOurError(error) {
+    if (!error) return false;
+    const stack = String(error.stack || "");
+    return stack.includes("hyprNET") || stack.includes("AstraFetch.user.js");
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                                     Utils                                  */
+  /* -------------------------------------------------------------------------- */
+
+  function toast(text, duration = CONFIG.toastDuration) {
+    let el = document.getElementById("af-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "af-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), duration);
+  }
+
+    try {
+      await fetch(CONFIG.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      log("warn", "Discord webhook failed", error?.message || error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
+  }
 
     try {
       await fetch(CONFIG.discordWebhook, {
@@ -1600,6 +1659,8 @@
     mutationObserver = null;
     mediaObserver = null;
     performanceObserver = null;
+    mutationObserver = null;
+    mediaObserver = null;
   }
 
   function resetState() {
@@ -1660,6 +1721,32 @@
       mediaObserver = null;
       setupMediaObserver();
       setupPerformanceObserver();
+    }
+  });
+
+  window.addEventListener("popstate", handleNavigationChange);
+
+  const originalPushState = history.pushState;
+  history.pushState = function (...args) {
+    originalPushState.apply(this, args);
+    handleNavigationChange();
+  };
+
+  window.addEventListener("error", event => {
+    if (!event?.error) return;
+    if (!isOurError(event.error)) return;
+    log("error", "Script error", event.error.message || event.error);
+  });
+
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && pingTimer) clearInterval(pingTimer);
+    if (!document.hidden && STATE.visible) startPing();
+    if (document.hidden) {
+      mediaObserver?.disconnect();
+    } else {
+      mediaObserver = null;
+      setupMediaObserver();
     }
   });
 
