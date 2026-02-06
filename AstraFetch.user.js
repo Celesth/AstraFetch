@@ -73,6 +73,7 @@
   let pingTimer;
   let mutationObserver;
   let mediaObserver;
+  let performanceObserver;
 
   /* -------------------------------------------------------------------------- */
   /*                                    Styles                                  */
@@ -635,6 +636,9 @@
 
   function setupPerformanceObserver() {
     if (!("PerformanceObserver" in window)) return;
+    if (performanceObserver) return;
+    performanceObserver = new PerformanceObserver(list => {
+      if (!STATE.ui.ready || !STATE.visible) return;
     const observer = new PerformanceObserver(list => {
       if (!STATE.ui.ready) return;
       list.getEntries().forEach(entry => {
@@ -652,6 +656,7 @@
         }
       });
     });
+    performanceObserver.observe({ entryTypes: ["resource"] });
     observer.observe({ entryTypes: ["resource"] });
   }
 
@@ -846,6 +851,7 @@
     if (mediaObserver) return;
     let scheduled = false;
     mediaObserver = new MutationObserver(() => {
+      if (!STATE.ui.ready || !STATE.visible) return;
       if (!STATE.ui.ready) return;
       if (scheduled) return;
       scheduled = true;
@@ -859,6 +865,7 @@
   }
 
   function scanMediaElements() {
+    if (!STATE.visible) return;
     const elements = document.querySelectorAll("video, audio");
     elements.forEach(element => {
       if (STATE.media.elements.has(element)) return;
@@ -1371,6 +1378,8 @@
     if (!hud) createHUD();
     hud.style.display = "block";
     STATE.visible = true;
+    setupPerformanceObserver();
+    setupMediaObserver();
     renderRows();
   }
 
@@ -1378,6 +1387,10 @@
     if (!hud) return;
     hud.style.display = "none";
     STATE.visible = false;
+    mediaObserver?.disconnect();
+    mediaObserver = null;
+    performanceObserver?.disconnect();
+    performanceObserver = null;
   }
 
   /* -------------------------------------------------------------------------- */
@@ -1400,6 +1413,8 @@
       <div class="divider"></div>
       <div class="log-list" id="af-log-list"></div>
       <div class="input-row">
+        <input id="af-console-input" type="text" placeholder="Copy JS payload (execution disabled)" />
+        <button id="af-console-run">Copy</button>
         <input id="af-console-input" type="text" placeholder="Run JS in page context..." />
         <button id="af-console-run">Run</button>
       </div>
@@ -1450,6 +1465,8 @@
     }
     const code = input.value;
     input.value = "";
+    safeClipboard(code);
+    log("warn", "Injection disabled by policy; code copied to clipboard.");
     try {
       const result = window.eval(code);
       log("warn", "Injected JS result", result);
@@ -1517,6 +1534,27 @@
     el.textContent = text;
     el.classList.add("show");
     setTimeout(() => el.classList.remove("show"), duration);
+  }
+
+    try {
+      await fetch(CONFIG.discordWebhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      log("warn", "Discord webhook failed", error?.message || error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
   }
 
     try {
@@ -1617,6 +1655,10 @@
   function teardownObservers() {
     mutationObserver?.disconnect();
     mediaObserver?.disconnect();
+    performanceObserver?.disconnect();
+    mutationObserver = null;
+    mediaObserver = null;
+    performanceObserver = null;
     mutationObserver = null;
     mediaObserver = null;
   }
@@ -1667,6 +1709,35 @@
       hideHUD();
     }
   });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && pingTimer) clearInterval(pingTimer);
+    if (!document.hidden && STATE.visible) startPing();
+    if (document.hidden) {
+      mediaObserver?.disconnect();
+      performanceObserver?.disconnect();
+      performanceObserver = null;
+    } else {
+      mediaObserver = null;
+      setupMediaObserver();
+      setupPerformanceObserver();
+    }
+  });
+
+  window.addEventListener("popstate", handleNavigationChange);
+
+  const originalPushState = history.pushState;
+  history.pushState = function (...args) {
+    originalPushState.apply(this, args);
+    handleNavigationChange();
+  };
+
+  window.addEventListener("error", event => {
+    if (!event?.error) return;
+    if (!isOurError(event.error)) return;
+    log("error", "Script error", event.error.message || event.error);
+  });
+
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && pingTimer) clearInterval(pingTimer);
