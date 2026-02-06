@@ -409,8 +409,8 @@
 
   function isOurError(error) {
     if (!error) return false;
-    const stack = String(error.stack || \"\");
-    return stack.includes(\"hyprNET\") || stack.includes(\"AstraFetch.user.js\");
+    const stack = String(error.stack || "");
+    return stack.includes("hyprNET") || stack.includes("AstraFetch.user.js");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -992,7 +992,7 @@
   }
 
   function isDirectFile(url) {
-    return /\\.(mp4|webm|mkv|mp3|ogg|wav)(\\?|$)/i.test(url || \"\");
+    return /\.(mp4|webm|mkv|mp3|ogg|wav)(\?|$)/i.test(url || "");
   }
 
   /* -------------------------------------------------------------------------- */
