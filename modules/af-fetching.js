@@ -6,8 +6,9 @@
   const { addEntry, updateStatus, updateSample, log, toast, normalizeUrl } = AstraFetch;
 
   function hookNetwork() {
-    const _fetch = window.fetch.bind(window);
-    window.fetch = (...args) => {
+    const _fetch = window.fetch?.bind(window);
+    if (!_fetch) return;
+    const wrappedFetch = (...args) => {
       const url = String(args[0]);
       const method = (args[1]?.method || "GET").toUpperCase();
       const entry = addEntry(url, "fetch", method, "fetch");
@@ -27,6 +28,19 @@
           throw error;
         });
     };
+    try {
+      window.fetch = wrappedFetch;
+    } catch (error) {
+      try {
+        Object.defineProperty(window, "fetch", {
+          configurable: true,
+          writable: true,
+          value: wrappedFetch
+        });
+      } catch (defineError) {
+        log("warn", "fetch hook skipped (read-only)", defineError?.message || defineError);
+      }
+    }
 
     const _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (_method, url) {
