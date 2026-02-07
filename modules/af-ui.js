@@ -267,9 +267,17 @@
       display: grid;
       grid-template-columns: 1fr auto;
       gap: 6px;
+      align-items: start;
     }
 
-    #af-console input {
+    #af-console .console-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #af-console input,
+    #af-console textarea {
       width: 100%;
       background: #0f0f0f;
       border: 1px solid #1e1e22;
@@ -277,6 +285,12 @@
       border-radius: 8px;
       padding: 6px 8px;
       font-size: 0.68rem;
+    }
+
+    #af-console textarea {
+      min-height: 80px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     }
 
     #af-toast {
@@ -388,6 +402,7 @@
     overlay.innerHTML = `
       <div class="overlay-title">AstraFetch Media</div>
       <div class="overlay-meta" id="af-media-meta"></div>
+      <div class="overlay-actions" id="af-media-actions"></div>
       <div class="overlay-actions">
         <button id="af-media-copy">Copy Current URL</button>
         <button id="af-media-hide">Hide</button>
@@ -414,12 +429,36 @@
     if (!meta) return;
     const src = element.currentSrc || element.src || "n/a";
     const duration = isFinite(element.duration) ? `${Math.round(element.duration)}s` : "live";
+    const tag = src.includes(".m3u8") ? "hls" : "media";
+    const cmdYt = buildYtDlpCommand(src, tag === "hls");
+    const cmdAria = buildAriaCommand(src);
+    const cmdHls = tag === "hls" ? buildHlsCommand(src) : null;
+    const cmdFfmpeg = tag === "media" ? buildFfmpegCommand(src) : null;
     meta.innerHTML = `
       <div><strong>Source:</strong> ${src}</div>
       <div><strong>Time:</strong> ${Math.round(element.currentTime)} / ${duration}</div>
       <div><strong>Rate:</strong> ${element.playbackRate}</div>
       <div><strong>Volume:</strong> ${Math.round(element.volume * 100)}%</div>
     `;
+    const actions = overlay.querySelector("#af-media-actions");
+    if (actions) {
+      actions.innerHTML = `
+        <button data-cmd="yt">Copy yt-dlp</button>
+        <button data-cmd="aria">Copy aria2</button>
+        ${cmdHls ? '<button data-cmd="hls">Copy HLS</button>' : ""}
+        ${cmdFfmpeg ? '<button data-cmd="ff">Copy ffmpeg</button>' : ""}
+      `;
+      actions.querySelectorAll("button").forEach(button => {
+        button.addEventListener("click", () => {
+          const cmd = button.getAttribute("data-cmd");
+          if (cmd === "yt") safeClipboard(cmdYt);
+          if (cmd === "aria") safeClipboard(cmdAria);
+          if (cmd === "hls" && cmdHls) safeClipboard(cmdHls);
+          if (cmd === "ff" && cmdFfmpeg) safeClipboard(cmdFfmpeg);
+          toast("Copied command");
+        });
+      });
+    }
     const rect = element.getBoundingClientRect();
     overlay.style.display = "block";
     overlay.style.top = `${Math.max(24, rect.top + window.scrollY - 12)}px`;
@@ -484,10 +523,10 @@
         AstraFetch.analyzeHls?.(entry);
       }
 
-      const cmdYtDlp = buildYtDlpCommand(entry.url, isHls);
-      const cmdAria = buildAriaCommand(entry.url);
-      const cmdHls = buildHlsCommand(entry.url);
-      const cmdFfmpeg = buildFfmpegCommand(entry.url);
+    const cmdYtDlp = isHls || entry.tag === "media" ? buildYtDlpCommand(entry.url, isHls) : null;
+    const cmdAria = entry.tag === "media" || isHls ? buildAriaCommand(entry.url) : null;
+    const cmdHls = isHls ? buildHlsCommand(entry.url) : null;
+    const cmdFfmpeg = entry.tag === "media" ? buildFfmpegCommand(entry.url) : null;
       const bitrate = entry.bitrate ? formatBitrate(entry.bitrate) : "bitrate n/a";
       const size = entry.totalTransfer ? formatBytes(entry.totalTransfer) : "size n/a";
       const average = entry.count ? formatDuration(entry.totalDuration / entry.count) : "n/a";
@@ -505,10 +544,10 @@
           <span>${bitrate}</span>
         </div>
         <div class="actions">
-          <button data-cmd="yt">Copy yt-dlp</button>
-          <button data-cmd="aria">Copy aria2</button>
-          ${isHls ? '<button data-cmd="hls">Copy HLS</button>' : ''}
-          ${isDirectFile(entry.url) ? '<button data-cmd="ff">Copy ffmpeg</button>' : ''}
+          ${cmdYtDlp ? '<button data-cmd="yt">Copy yt-dlp</button>' : ""}
+          ${cmdAria ? '<button data-cmd="aria">Copy aria2</button>' : ""}
+          ${cmdHls ? '<button data-cmd="hls">Copy HLS</button>' : ""}
+          ${cmdFfmpeg ? '<button data-cmd="ff">Copy ffmpeg</button>' : ""}
           <button data-cmd="raw">Copy URL</button>
         </div>
         <div class="samples ${entry.open ? "open" : ""}">
@@ -528,10 +567,10 @@
       actionButtons.forEach(button => {
         button.addEventListener("click", () => {
           const cmd = button.getAttribute("data-cmd");
-          if (cmd === "yt") safeClipboard(cmdYtDlp);
-          if (cmd === "aria") safeClipboard(cmdAria);
-          if (cmd === "hls") safeClipboard(cmdHls);
-          if (cmd === "ff") safeClipboard(cmdFfmpeg);
+          if (cmd === "yt" && cmdYtDlp) safeClipboard(cmdYtDlp);
+          if (cmd === "aria" && cmdAria) safeClipboard(cmdAria);
+          if (cmd === "hls" && cmdHls) safeClipboard(cmdHls);
+          if (cmd === "ff" && cmdFfmpeg) safeClipboard(cmdFfmpeg);
           if (cmd === "raw") safeClipboard(entry.url);
           toast("Copied command");
         });
@@ -575,8 +614,11 @@
       <div class="log-list" id="af-log-list"></div>
       <div class="divider"></div>
       <div class="input-row">
-        <input id="af-console-input" placeholder="Type JS code to copy" />
-        <button id="af-console-run">Copy</button>
+        <textarea id="af-console-input" placeholder="Type JavaScript here"></textarea>
+        <div class="console-actions">
+          <button id="af-console-run">Run</button>
+          <button id="af-console-copy">Copy</button>
+        </div>
       </div>
     `;
     document.body.appendChild(refs.consolePanel);
@@ -586,9 +628,10 @@
       renderConsole();
     });
 
-    refs.consolePanel.querySelector("#af-console-run")?.addEventListener("click", runConsoleCommand);
+    refs.consolePanel.querySelector("#af-console-run")?.addEventListener("click", () => runConsoleCommand("run"));
+    refs.consolePanel.querySelector("#af-console-copy")?.addEventListener("click", () => runConsoleCommand("copy"));
     refs.consolePanel.querySelector("#af-console-input")?.addEventListener("keydown", event => {
-      if (event.key === "Enter") runConsoleCommand();
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) runConsoleCommand("run");
     });
   }
 
@@ -611,7 +654,7 @@
     });
   }
 
-  function runConsoleCommand() {
+  function runConsoleCommand(mode) {
     const input = refs.consolePanel.querySelector("#af-console-input");
     if (!input || !input.value.trim()) return;
     if (!STATE.console.armed) {
@@ -619,11 +662,20 @@
       return;
     }
     const code = input.value;
-    input.value = "";
-    safeClipboard(code);
-    log("warn", "Injection disabled by policy; code copied to clipboard.");
-    STATE.console.armed = false;
-    renderConsole();
+    if (mode === "copy") {
+      safeClipboard(code);
+      log("warn", "Code copied to clipboard.");
+      return;
+    }
+    try {
+      const result = (0, eval)(code);
+      log("info", "Execution result", result);
+    } catch (error) {
+      log("error", "Execution failed", error?.message || error);
+    } finally {
+      STATE.console.armed = false;
+      renderConsole();
+    }
   }
 
   Object.assign(AstraFetch, {
