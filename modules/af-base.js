@@ -4,7 +4,7 @@
   const GM = globalThis.AstraFetchGM || {};
 
   const CONFIG = {
-    triggerKey: "/",
+    triggerKey: "*",
     toggleMode: true,
     guiPosition: "bottom-right", // top-left | top-right | bottom-left | bottom-right
     width: 520,
