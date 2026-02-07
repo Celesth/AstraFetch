@@ -19,9 +19,9 @@
     isDirectFile
   } = AstraFetch;
 
-  const { GM_addStyle } = GM;
+  const { GM_addStyle, GM_addElement } = GM;
 
-  GM_addStyle?.(`
+  const styles = `
     #af-hud {
       position: fixed;
       ${positionStyle()}
@@ -328,7 +328,17 @@
     #af-media-overlay .overlay-actions button {
       font-size: 0.62rem;
     }
-  `);
+  `;
+
+  if (GM_addStyle) {
+    GM_addStyle(styles);
+  } else if (GM_addElement) {
+    GM_addElement("style", { textContent: styles });
+  } else {
+    const styleEl = document.createElement("style");
+    styleEl.textContent = styles;
+    document.head?.appendChild(styleEl);
+  }
 
   function positionStyle() {
     const p = CONFIG.guiPosition;
