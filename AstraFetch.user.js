@@ -2,7 +2,7 @@
 // @name         hyprNET (Stream Analyzer)
 // @namespace    https://github.com/Celesth/AstraFetch
 // @icon         https://files.catbox.moe/cd88m5.png
-// @version      0.6.0
+// @version      0.6.1
 // @description  Hyprland-style network + media intelligence HUD (analysis-safe)
 // @match        *://*/*
 // @grant        GM_addStyle
@@ -585,24 +585,25 @@
 
   function hookNetwork() {
     const _fetch = window.fetch.bind(window);
-    window.fetch = async (...args) => {
+    window.fetch = (...args) => {
       const url = String(args[0]);
       const method = (args[1]?.method || "GET").toUpperCase();
       const entry = addEntry(url, "fetch", method, "fetch");
       const start = performance.now();
-      try {
-        const res = await _fetch(...args);
-        const duration = performance.now() - start;
-        updateStatus(url, `${res.status}`);
-        updateSample(entry, duration, 0, res.status);
-        return res;
-      } catch (error) {
-        const duration = performance.now() - start;
-        updateStatus(url, "ERR");
-        updateSample(entry, duration, 0, "ERR");
-        log("error", "fetch error", error?.message || error);
-        throw error;
-      }
+      return _fetch(...args)
+        .then(res => {
+          const duration = performance.now() - start;
+          updateStatus(url, `${res.status}`);
+          updateSample(entry, duration, 0, res.status);
+          return res;
+        })
+        .catch(error => {
+          const duration = performance.now() - start;
+          updateStatus(url, "ERR");
+          updateSample(entry, duration, 0, "ERR");
+          log("error", "fetch error", error?.message || error);
+          throw error;
+        });
     };
 
     const _open = XMLHttpRequest.prototype.open;
@@ -679,47 +680,50 @@
   /* -------------------------------------------------------------------------- */
 
   // Attempt to inspect playlists only when CORS allows; never decrypt or bypass DRM.
-  async function analyzeHls(entry) {
+  function analyzeHls(entry) {
     if (!entry || entry.hls.analyzed || entry.encrypted) return;
     entry.hls.analyzed = true;
     entry.hls.error = null;
     updateStatus(entry.url, "analyzing");
-    try {
-      const cached = STATE.cache.streamFingerprints.get(entry.url);
-      const parsed = cached || await fetchAndParsePlaylist(entry.url);
-      if (!cached) {
-        STATE.cache.streamFingerprints.set(entry.url, parsed);
-      }
-      entry.hls.variants = parsed.variants;
-      entry.hls.segments = parsed.segments;
-      entry.hls.audioOnly = parsed.audioOnly;
-      entry.hls.live = parsed.live;
-      entry.hls.encryption = parsed.encryption;
-      if (parsed.encrypted) {
-        entry.encrypted = true;
-        entry.status = "encrypted";
-        const method = parsed.encryption || "AES-128";
-        toast(`Encrypted HLS detected (${method}).`);
-        updateStatus(entry.url, "encrypted");
-        return;
-      } else {
+    const cached = STATE.cache.streamFingerprints.get(entry.url);
+    const parsePromise = cached ? Promise.resolve(cached) : fetchAndParsePlaylist(entry.url);
+    parsePromise
+      .then(parsed => {
+        if (!cached) {
+          STATE.cache.streamFingerprints.set(entry.url, parsed);
+        }
+        entry.hls.variants = parsed.variants;
+        entry.hls.segments = parsed.segments;
+        entry.hls.audioOnly = parsed.audioOnly;
+        entry.hls.live = parsed.live;
+        entry.hls.encryption = parsed.encryption;
+        if (parsed.encrypted) {
+          entry.encrypted = true;
+          entry.status = "encrypted";
+          const method = parsed.encryption || "AES-128";
+          toast(`Encrypted HLS detected (${method}).`);
+          updateStatus(entry.url, "encrypted");
+          return;
+        }
         entry.status = "ok";
-      }
-      updateStatus(entry.url, entry.status);
-      scheduleRender();
-    } catch (error) {
-      entry.hls.error = "CORS blocked or unavailable";
-      updateStatus(entry.url, "blocked");
-      toast("HLS inspection blocked by CORS.");
-      log("warn", "HLS inspection blocked", error?.message || error);
-    }
+        updateStatus(entry.url, entry.status);
+        scheduleRender();
+      })
+      .catch(error => {
+        entry.hls.error = "CORS blocked or unavailable";
+        updateStatus(entry.url, "blocked");
+        toast("HLS inspection blocked by CORS.");
+        log("warn", "HLS inspection blocked", error?.message || error);
+      });
   }
 
-  async function fetchAndParsePlaylist(url) {
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    return parsePlaylist(text, url);
+  function fetchAndParsePlaylist(url) {
+    return fetch(url, { credentials: "include" })
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.text();
+      })
+      .then(text => parsePlaylist(text, url));
   }
 
   function parsePlaylist(text, baseUrl) {
@@ -771,7 +775,7 @@
     };
   }
 
-  async function probeVariants(entry) {
+  function probeVariants(entry) {
     if (!entry) return;
     const cached = STATE.cache.probeCache.get(entry.url);
     if (cached) {
@@ -791,24 +795,27 @@
     entry.probes = probes;
     scheduleRender();
 
-    await Promise.all(
-      probes.map(async probe => {
-        try {
-          let res = await fetch(probe.url, { method: "HEAD" });
-          if (!res.ok) {
-            res = await fetch(probe.url, {
+    Promise.all(
+      probes.map(probe => {
+        return fetch(probe.url, { method: "HEAD" })
+          .then(res => {
+            if (res.ok) return res;
+            return fetch(probe.url, {
               method: "GET",
               headers: { Range: "bytes=0-1023" }
             });
-          }
-          probe.status = res.ok ? "ok" : `HTTP ${res.status}`;
-        } catch {
-          probe.status = "blocked";
-        }
+          })
+          .then(res => {
+            probe.status = res.ok ? "ok" : `HTTP ${res.status}`;
+          })
+          .catch(() => {
+            probe.status = "blocked";
+          });
       })
-    );
-    STATE.cache.probeCache.set(entry.url, probes);
-    scheduleRender();
+    ).then(() => {
+      STATE.cache.probeCache.set(entry.url, probes);
+      scheduleRender();
+    });
   }
 
   function generateQualityProbes(url) {
@@ -1469,7 +1476,7 @@
   /*                               Discord Webhook                              */
   /* -------------------------------------------------------------------------- */
 
-  async function maybeSendWebhook(entry) {
+  function maybeSendWebhook(entry) {
     if (!CONFIG.discordWebhook) return;
     const now = Date.now();
     if (now - STATE.discordLastSent < CONFIG.discordRateLimitMs) return;
@@ -1566,37 +1573,13 @@
     }
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                                 Ping Meter                                 */
-  /* -------------------------------------------------------------------------- */
-
-  async function updatePing() {
-    const el = document.getElementById("af-ping");
-    if (!el) return;
-    const start = performance.now();
-    try {
-      await fetch(location.origin, { method: "HEAD", cache: "no-store" });
-      const ms = Math.round(performance.now() - start);
-      el.textContent = `ping ${ms}ms`;
-    } catch {
-      el.textContent = "ping blocked";
-    }
-  }
-
-  function startPing() {
-    updatePing();
-    pingTimer = setInterval(updatePing, CONFIG.pingInterval);
-  }
-
-    try {
-      await fetch(CONFIG.discordWebhook, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-    } catch (error) {
+    fetch(CONFIG.discordWebhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).catch(error => {
       log("warn", "Discord webhook failed", error?.message || error);
-    }
+    });
   }
 
   function sanitizeUrl(url) {
@@ -1613,17 +1596,18 @@
   /*                                 Ping Meter                                 */
   /* -------------------------------------------------------------------------- */
 
-  async function updatePing() {
+  function updatePing() {
     const el = document.getElementById("af-ping");
     if (!el) return;
     const start = performance.now();
-    try {
-      await fetch(location.origin, { method: "HEAD", cache: "no-store" });
-      const ms = Math.round(performance.now() - start);
-      el.textContent = `ping ${ms}ms`;
-    } catch {
-      el.textContent = "ping blocked";
-    }
+    fetch(location.origin, { method: "HEAD", cache: "no-store" })
+      .then(() => {
+        const ms = Math.round(performance.now() - start);
+        el.textContent = `ping ${ms}ms`;
+      })
+      .catch(() => {
+        el.textContent = "ping blocked";
+      });
   }
 
   function startPing() {
