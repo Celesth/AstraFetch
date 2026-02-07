@@ -31,7 +31,12 @@
     title: null,
     visible: false,
     ui: {
-      ready: false
+      ready: false,
+      search: {
+        query: "",
+        tags: new Set()
+      },
+      highlightedUrl: ""
     },
     entries: new Map(),
     needsRender: false,

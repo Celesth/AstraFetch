@@ -11,7 +11,6 @@
     toast,
     log,
     scheduleRender,
-    updateStatus,
     buildYtDlpCommand,
     buildAriaCommand,
     buildHlsCommand,
@@ -28,11 +27,14 @@
       z-index: 2147483647;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       color: #e5e7eb;
+      padding: 8px;
+      box-sizing: border-box;
     }
 
     #af-hud .panel,
     #af-console {
       width: ${CONFIG.width}px;
+      box-sizing: border-box;
       background: rgba(12, 12, 14, 0.92);
       border: 1px solid #1e1e22;
       border-radius: 12px;
@@ -46,6 +48,7 @@
 
     #af-hud .panel {
       height: ${CONFIG.height}px;
+      max-height: ${CONFIG.height}px;
     }
 
     #af-hud .topbar {
@@ -94,6 +97,44 @@
       padding-right: 4px;
     }
 
+    #af-hud .search {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+
+    #af-hud .search input {
+      width: 100%;
+      background: #0f0f0f;
+      border: 1px solid #1e1e22;
+      color: #e5e7eb;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 0.68rem;
+    }
+
+    #af-hud .tag-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    #af-hud .tag-filter {
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      border-radius: 999px;
+      padding: 2px 8px;
+      border: 1px solid #1e1e22;
+      background: rgba(12, 12, 14, 0.6);
+      color: #9ca3af;
+      cursor: pointer;
+    }
+
+    #af-hud .tag-filter.active {
+      border-color: rgba(96, 165, 250, 0.8);
+      color: #e5e7eb;
+    }
+
     #af-hud .row {
       border: 1px solid #1f1f26;
       border-radius: 10px;
@@ -112,6 +153,7 @@
     #af-hud .row.streaming { border-color: rgba(56, 189, 248, 0.6); }
     #af-hud .row.encrypted { border-color: rgba(248, 113, 113, 0.8); box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35); }
     #af-hud .row.pending { border-color: rgba(100, 116, 139, 0.5); }
+    #af-hud .row.highlight { border-color: rgba(96, 165, 250, 0.9); box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.5); }
 
     #af-hud .row-head {
       display: grid;
@@ -142,11 +184,16 @@
     #af-hud .tag.static { color: #a78bfa; }
     #af-hud .tag.other { color: #71717a; }
 
-    #af-hud .url {
+    #af-hud .url-link {
       color: #e5e7eb;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      text-align: left;
+      background: transparent;
+      border: none;
+      padding: 0;
+      cursor: pointer;
     }
 
     #af-hud .status {
@@ -326,6 +373,13 @@
       min-width: 220px;
     }
 
+    #af-media-overlay.fixed {
+      left: 24px;
+      bottom: 24px;
+      top: auto;
+      right: auto;
+    }
+
     #af-media-overlay .overlay-title {
       font-size: 0.75rem;
       text-transform: uppercase;
@@ -391,7 +445,11 @@
   }
 
   function handleMediaEvent(element) {
+    if (STATE.media.activeElement && STATE.media.activeElement !== element) {
+      STATE.media.activeElement.style.outline = "";
+    }
     STATE.media.activeElement = element;
+    STATE.media.activeElement.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
     if (!STATE.media.overlay) createMediaOverlay();
     renderMediaOverlay();
   }
@@ -433,7 +491,6 @@
     const cmdYt = buildYtDlpCommand(src, tag === "hls");
     const cmdAria = buildAriaCommand(src);
     const cmdHls = tag === "hls" ? buildHlsCommand(src) : null;
-    const cmdFfmpeg = tag === "media" ? buildFfmpegCommand(src) : null;
     meta.innerHTML = `
       <div><strong>Source:</strong> ${src}</div>
       <div><strong>Time:</strong> ${Math.round(element.currentTime)} / ${duration}</div>
@@ -446,7 +503,6 @@
         <button data-cmd="yt">Copy yt-dlp</button>
         <button data-cmd="aria">Copy aria2</button>
         ${cmdHls ? '<button data-cmd="hls">Copy HLS</button>' : ""}
-        ${cmdFfmpeg ? '<button data-cmd="ff">Copy ffmpeg</button>' : ""}
       `;
       actions.querySelectorAll("button").forEach(button => {
         button.addEventListener("click", () => {
@@ -454,15 +510,12 @@
           if (cmd === "yt") safeClipboard(cmdYt);
           if (cmd === "aria") safeClipboard(cmdAria);
           if (cmd === "hls" && cmdHls) safeClipboard(cmdHls);
-          if (cmd === "ff" && cmdFfmpeg) safeClipboard(cmdFfmpeg);
           toast("Copied command");
         });
       });
     }
-    const rect = element.getBoundingClientRect();
+    overlay.classList.add("fixed");
     overlay.style.display = "block";
-    overlay.style.top = `${Math.max(24, rect.top + window.scrollY - 12)}px`;
-    overlay.style.left = `${Math.max(24, rect.left + window.scrollX)}px`;
   }
 
   /* -------------------------------------------------------------------------- */
@@ -485,6 +538,10 @@
             </div>
           </div>
           <div class="subtitle">Analysis-safe network & media HUD</div>
+          <div class="search">
+            <input id="af-search" placeholder="Search media, mp4, mkv, hls, m3u8, blob..." />
+            <div class="tag-filters" id="af-tag-filters"></div>
+          </div>
         </div>
         <div class="divider"></div>
         <div class="rows" id="af-rows"></div>
@@ -496,6 +553,87 @@
       STATE.console.open = !STATE.console.open;
       renderConsole();
     });
+
+    setupSearchUi();
+  }
+
+  const TAG_FILTERS = ["media", "hls", "m3u8", "mp4", "mkv", "blob"];
+
+  function setupSearchUi() {
+    const input = refs.hud.querySelector("#af-search");
+    const tags = refs.hud.querySelector("#af-tag-filters");
+    if (input) {
+      input.value = STATE.ui.search.query;
+      input.addEventListener("input", event => {
+        STATE.ui.search.query = event.target.value;
+        renderRows();
+      });
+    }
+    if (tags) {
+      tags.innerHTML = "";
+      TAG_FILTERS.forEach(tag => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `tag-filter ${STATE.ui.search.tags.has(tag) ? "active" : ""}`;
+        button.textContent = tag;
+        button.addEventListener("click", () => {
+          if (STATE.ui.search.tags.has(tag)) {
+            STATE.ui.search.tags.delete(tag);
+          } else {
+            STATE.ui.search.tags.add(tag);
+          }
+          button.classList.toggle("active");
+          renderRows();
+        });
+        tags.appendChild(button);
+      });
+    }
+  }
+
+  function matchesSearch(entry) {
+    const query = STATE.ui.search.query.trim().toLowerCase();
+    const tokens = query ? query.split(/[\s,]+/).filter(Boolean) : [];
+    const tagFilters = STATE.ui.search.tags;
+    const haystack = `${entry.tag} ${entry.url}`.toLowerCase();
+
+    if (tagFilters.size) {
+      const tagMatch = Array.from(tagFilters).some(tag => matchesTag(entry, tag));
+      if (!tagMatch) return false;
+    }
+
+    if (!tokens.length) return true;
+
+    return tokens.every(token => {
+      if (matchesTag(entry, token)) return true;
+      return haystack.includes(token);
+    });
+  }
+
+  function matchesTag(entry, token) {
+    const lower = token.toLowerCase();
+    if (lower === "media") return entry.tag === "media";
+    if (lower === "hls" || lower === "m3u8") return entry.tag === "hls" || entry.url.includes(".m3u8");
+    if (lower === "mp4" || lower === "mkv") return entry.url.includes(`.${lower}`);
+    if (lower === "blob") return entry.tag === "blob" || entry.url.startsWith("blob:");
+    return entry.tag === lower;
+  }
+
+  function highlightEntry(entry) {
+    STATE.ui.highlightedUrl = entry.url;
+    scheduleRender();
+    highlightMediaElement(entry.url);
+  }
+
+  function highlightMediaElement(url) {
+    const previous = STATE.media.activeElement;
+    if (previous) previous.style.outline = "";
+    const candidate = Array.from(document.querySelectorAll("video, audio")).find(element => {
+      const src = element.currentSrc || element.src || element.querySelector("source")?.src || "";
+      return src && (src === url || src.includes(url) || url.includes(src));
+    });
+    if (candidate) {
+      candidate.style.outline = `2px solid ${CONFIG.overlayOutlineColor}`;
+    }
   }
 
   function renderRows() {
@@ -508,25 +646,28 @@
       (a, b) => b.addedAt - a.addedAt
     );
 
-    if (!entries.length) {
+    const filtered = entries.filter(entry => matchesSearch(entry));
+
+    if (!filtered.length) {
       container.innerHTML = `<div class="status">No streams detected yet.</div>`;
       return;
     }
 
-    entries.forEach(entry => {
+    filtered.forEach(entry => {
       const row = document.createElement("div");
       const status = entry.status || "pending";
-      row.className = `row ${status === "ok" ? "success" : status === "pending" ? "pending" : status === "encrypted" ? "encrypted" : status === "blocked" ? "blocked" : status === "streaming" ? "streaming" : status === "ERR" || String(status).startsWith("5") ? "error" : status === "slow" ? "slow" : ""}`;
+      const highlight = STATE.ui.highlightedUrl === entry.url ? "highlight" : "";
+      row.className = `row ${highlight} ${status === "ok" ? "success" : status === "pending" ? "pending" : status === "encrypted" ? "encrypted" : status === "blocked" ? "blocked" : status === "streaming" ? "streaming" : status === "ERR" || String(status).startsWith("5") ? "error" : status === "slow" ? "slow" : ""}`;
 
       const isHls = entry.tag === "hls";
       if (isHls && !entry.hls.analyzed && !entry.encrypted) {
         AstraFetch.analyzeHls?.(entry);
       }
 
-    const cmdYtDlp = isHls || entry.tag === "media" ? buildYtDlpCommand(entry.url, isHls) : null;
-    const cmdAria = entry.tag === "media" || isHls ? buildAriaCommand(entry.url) : null;
-    const cmdHls = isHls ? buildHlsCommand(entry.url) : null;
-    const cmdFfmpeg = entry.tag === "media" ? buildFfmpegCommand(entry.url) : null;
+      const cmdYtDlp = isHls || entry.tag === "media" ? buildYtDlpCommand(entry.url, isHls) : null;
+      const cmdAria = entry.tag === "media" || isHls ? buildAriaCommand(entry.url) : null;
+      const cmdHls = isHls ? buildHlsCommand(entry.url) : null;
+      const cmdFfmpeg = entry.tag === "media" ? buildFfmpegCommand(entry.url) : null;
       const bitrate = entry.bitrate ? formatBitrate(entry.bitrate) : "bitrate n/a";
       const size = entry.totalTransfer ? formatBytes(entry.totalTransfer) : "size n/a";
       const average = entry.count ? formatDuration(entry.totalDuration / entry.count) : "n/a";
@@ -534,7 +675,7 @@
       row.innerHTML = `
         <div class="row-head">
           <span class="tag ${entry.tag}">${entry.tag}</span>
-          <span class="url">${entry.url}</span>
+          <button class="url-link" type="button">${entry.url}</button>
           <span class="status">${status}</span>
         </div>
         <div class="meta">
@@ -561,6 +702,11 @@
       rowHead?.addEventListener("click", () => {
         entry.open = !entry.open;
         scheduleRender();
+      });
+
+      row.querySelector(".url-link")?.addEventListener("click", event => {
+        event.stopPropagation();
+        highlightEntry(entry);
       });
 
       const actionButtons = row.querySelectorAll("button[data-cmd]");
@@ -592,6 +738,9 @@
     STATE.visible = false;
     if (refs.hud) refs.hud.style.display = "none";
     if (refs.pingTimer) clearInterval(refs.pingTimer);
+    if (STATE.media.activeElement) {
+      STATE.media.activeElement.style.outline = "";
+    }
   }
 
   /* -------------------------------------------------------------------------- */
