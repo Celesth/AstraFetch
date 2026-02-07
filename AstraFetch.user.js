@@ -6,6 +6,7 @@
 // @description  AstraFetch modular loader for the stream analyzer HUD.
 // @match        *://*/*
 // @grant        GM_addStyle
+// @grant        GM_addElement
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
 // @connect      raw.githubusercontent.com
@@ -16,6 +17,7 @@
 
   globalThis.AstraFetchGM = {
     GM_addStyle,
+    GM_addElement,
     GM_setClipboard,
     GM_xmlhttpRequest
   };
@@ -49,7 +51,11 @@
   const loadModule = async url => {
     const code = await fetchText(url);
     const wrapped = `${code}\n//# sourceURL=${url}`;
-    new Function(wrapped)();
+    if (GM_addElement) {
+      GM_addElement("script", { textContent: wrapped });
+      return;
+    }
+    throw new Error("GM_addElement unavailable; CSP blocks dynamic eval");
   };
 
   const start = async () => {
