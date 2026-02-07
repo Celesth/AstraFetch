@@ -1,7 +1,14 @@
 (() => {
   "use strict";
 
-  const GM = globalThis.AstraFetchGM || {};
+  const GM = globalThis.AstraFetchGM || {
+    GM_addStyle,
+    GM_addElement,
+    GM_setClipboard,
+    GM_xmlhttpRequest
+  };
+
+  globalThis.AstraFetchGM = GM;
 
   const CONFIG = {
     triggerKey: "/",
