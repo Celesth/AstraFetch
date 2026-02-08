@@ -113,28 +113,6 @@
       font-size: 0.68rem;
     }
 
-    #af-hud .tag-filters {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-
-    #af-hud .tag-filter {
-      font-size: 0.6rem;
-      text-transform: uppercase;
-      border-radius: 999px;
-      padding: 2px 8px;
-      border: 1px solid #1e1e22;
-      background: rgba(12, 12, 14, 0.6);
-      color: #9ca3af;
-      cursor: pointer;
-    }
-
-    #af-hud .tag-filter.active {
-      border-color: rgba(96, 165, 250, 0.8);
-      color: #e5e7eb;
-    }
-
     #af-hud .row {
       border: 1px solid #1f1f26;
       border-radius: 10px;
@@ -157,32 +135,12 @@
 
     #af-hud .row-head {
       display: grid;
-      grid-template-columns: 72px 1fr auto;
+      grid-template-columns: 1fr auto;
       gap: 8px;
       align-items: center;
       font-size: 0.72rem;
       cursor: pointer;
     }
-
-    #af-hud .tag {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 2px 6px;
-      border-radius: 6px;
-      background: rgba(12, 12, 14, 0.6);
-      border: 1px solid #1e1e22;
-      font-size: 0.6rem;
-      text-transform: uppercase;
-    }
-
-    #af-hud .tag.hls { color: #38bdf8; }
-    #af-hud .tag.blob { color: #a78bfa; }
-    #af-hud .tag.media { color: #22c55e; }
-    #af-hud .tag.image { color: #60a5fa; }
-    #af-hud .tag.api { color: #fbbf24; }
-    #af-hud .tag.static { color: #a78bfa; }
-    #af-hud .tag.other { color: #71717a; }
 
     #af-hud .url-link {
       color: #e5e7eb;
@@ -534,13 +492,12 @@
               <span class="ping" id="af-ping">ping --</span>
             </div>
             <div>
-              <button id="af-console-toggle">Console</button>
+              <button id="af-hud-close">Close</button>
             </div>
           </div>
           <div class="subtitle">Analysis-safe network & media HUD</div>
           <div class="search">
             <input id="af-search" placeholder="Search media, mp4, mkv, hls, m3u8, blob..." />
-            <div class="tag-filters" id="af-tag-filters"></div>
           </div>
         </div>
         <div class="divider"></div>
@@ -549,19 +506,13 @@
     `;
     document.body.appendChild(refs.hud);
 
-    refs.hud.querySelector("#af-console-toggle")?.addEventListener("click", () => {
-      STATE.console.open = !STATE.console.open;
-      renderConsole();
-    });
+    refs.hud.querySelector("#af-hud-close")?.addEventListener("click", hideHUD);
 
     setupSearchUi();
   }
 
-  const TAG_FILTERS = ["media", "hls", "m3u8", "mp4", "mkv", "blob"];
-
   function setupSearchUi() {
     const input = refs.hud.querySelector("#af-search");
-    const tags = refs.hud.querySelector("#af-tag-filters");
     if (input) {
       input.value = STATE.ui.search.query;
       input.addEventListener("input", event => {
@@ -569,37 +520,12 @@
         renderRows();
       });
     }
-    if (tags) {
-      tags.innerHTML = "";
-      TAG_FILTERS.forEach(tag => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = `tag-filter ${STATE.ui.search.tags.has(tag) ? "active" : ""}`;
-        button.textContent = tag;
-        button.addEventListener("click", () => {
-          if (STATE.ui.search.tags.has(tag)) {
-            STATE.ui.search.tags.delete(tag);
-          } else {
-            STATE.ui.search.tags.add(tag);
-          }
-          button.classList.toggle("active");
-          renderRows();
-        });
-        tags.appendChild(button);
-      });
-    }
   }
 
   function matchesSearch(entry) {
     const query = STATE.ui.search.query.trim().toLowerCase();
     const tokens = query ? query.split(/[\s,]+/).filter(Boolean) : [];
-    const tagFilters = STATE.ui.search.tags;
     const haystack = `${entry.tag} ${entry.url}`.toLowerCase();
-
-    if (tagFilters.size) {
-      const tagMatch = Array.from(tagFilters).some(tag => matchesTag(entry, tag));
-      if (!tagMatch) return false;
-    }
 
     if (!tokens.length) return true;
 
@@ -614,8 +540,8 @@
     if (lower === "media") return entry.tag === "media";
     if (lower === "hls" || lower === "m3u8") return entry.tag === "hls" || entry.url.includes(".m3u8");
     if (lower === "mp4" || lower === "mkv") return entry.url.includes(`.${lower}`);
-    if (lower === "blob") return entry.tag === "blob" || entry.url.startsWith("blob:");
-    return entry.tag === lower;
+    if (lower === "blob") return entry.url.startsWith("blob:");
+    return false;
   }
 
   function highlightEntry(entry) {
@@ -674,7 +600,6 @@
 
       row.innerHTML = `
         <div class="row-head">
-          <span class="tag ${entry.tag}">${entry.tag}</span>
           <button class="url-link" type="button">${entry.url}</button>
           <span class="status">${status}</span>
         </div>

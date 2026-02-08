@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         AstraFetch (Stream Analyzer)
-// @namespace    https://github.com/Celesth/AstraFetch        
+// @namespace    https://github.com/Celesth/AstraFetch
+// @icon         
 // @version      0.7.2
 // @description  AstraFetch modular entrypoint for the stream analyzer HUD.
 // @match        *://*/*

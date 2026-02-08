@@ -135,14 +135,10 @@
     }
   }
 
-  function classify(url, initiator) {
+  function classify(url) {
     const lower = url.toLowerCase();
-    if (lower.startsWith("blob:")) return "blob";
     if (lower.includes(".m3u8")) return "hls";
     if (lower.match(/\.(mp4|webm|mkv|mp3|ogg|wav)(\?|$)/)) return "media";
-    if (lower.match(/\.(png|jpg|jpeg|gif|webp|svg)(\?|$)/)) return "image";
-    if (lower.match(/\.(js|css|woff2?|ttf|otf)(\?|$)/)) return "static";
-    if (initiator === "fetch" || initiator === "xmlhttprequest") return "api";
     return "other";
   }
 
@@ -195,6 +191,7 @@
     const clean = normalizeUrl(url);
     if (!clean) return null;
     const tag = classify(clean, initiator || source);
+    if (tag === "other") return null;
 
     const isNew = !STATE.entries.has(clean);
     if (isNew) {
